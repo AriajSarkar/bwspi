@@ -1,4 +1,6 @@
-# Sarkar Bucket Array (SBA) — Bit-Width Sparse Pointer Index (BWSPI)
+# BWSPI — Bit-Width Sparse Pointer Index
+
+*Also known as the **Sarkar Bucket Array (SBA)***
 
 > A zero-hash, single-instruction routed sparse indexing system for unsorted dynamic data streams.
 
@@ -8,16 +10,24 @@
 
 ---
 
-## What is SBA / BWSPI?
+## Why BWSPI?
 
-**Sarkar Bucket Array (SBA)**, formally the **Bit-Width Sparse Pointer Index (BWSPI)**, is a novel data structure that replaces cryptographic hashing with a physical property of the data — its **binary bit-width** — as a zero-cost routing key.
+If your workload is **insert-heavy**, **append-only**, or **latency-sensitive** — BWSPI is built for you:
 
-Instead of spending CPU cycles on hash functions (SipHash: ~60 instructions, AES-NI: ~15 instructions, FxHash: ~5 instructions), BWSPI routes every element in **exactly 1 CPU instruction** (`LZCNT` on x86-64, `CLZ` on ARM).
+- **5× faster insertion** than HashMap at 1M elements (6 ns vs 31 ns per element)
+- **Half the memory** — 15.9 MB vs 34.0 MB at 1M elements
+- **Zero rehash spikes** — no O(n) pauses, ever
+- **Native duplicate support** — no overwrites like HashMap
+- **98% search space reduction** on high-entropy data
+
+BWSPI replaces cryptographic hashing with a physical property of the data — its **binary bit-width** — as a zero-cost routing key. Routing costs **exactly 1 CPU instruction** (`LZCNT` on x86-64, `CLZ` on ARM), compared to 60+ for SipHash or 15+ for AES-NI.
 
 ```
 HashMap:  value → hash(value) → bucket     (60+ CPU instructions)
 BWSPI:   value → bit_width(value) → bucket (1 CPU instruction)
 ```
+
+> **Trade-off**: Lookup is O(k) where k = bucket size, not O(1) amortized like HashMap. BWSPI is an integer index/set, not a general-purpose key-value map. See [When to Use](#when-to-use-bwspi) and [docs/trade-offs.md](docs/trade-offs.md) for details.
 
 ---
 
@@ -66,16 +76,18 @@ All benchmarks run with `RUSTFLAGS="-C target-cpu=native"`, measured by [Criteri
 | SwissTable (hashbrown 0.17) | 1.64 ns | Google SwissTable + foldhash |
 | FxHashMap | 1.90 ns | Fastest integer hash, no DoS protection |
 | AHashMap | 2.38 ns | AES-NI hardware hashing |
-| **SBA / BWSPI (scalar)** | **2.66 ns** | Compiler auto-vectorized scan |
-| **SBA / BWSPI (SIMD)** | **2.76 ns** | Manual AVX2 (4×u64 per cycle) |
+| **BWSPI (scalar)** | **2.66 ns** | Compiler auto-vectorized scan |
+| **BWSPI (AVX2 SIMD)** | **2.76 ns** | Manual AVX2 (4×u64 per cycle) |
 | HashMap (std) | 10.28 ns | SipHash-1-3 (DoS-resistant) |
 | Linear scan | 137.68 ns | Full Vec scan |
+
+> **On SIMD vs scalar at N=1K**: At high-entropy with 1K elements, buckets average ~15 entries. The manual AVX2 gather (4 scalar loads → stack array → SIMD compare) can't beat the compiler's auto-vectorized loop at that size. SIMD's 4×u64 throughput advantage shows at **large bucket sizes** (100+ entries) — specifically the uniform-width worst case where a single bucket holds all N elements.
 
 ### Insertion — N=1,000,000 (High Entropy)
 
 | Structure | Total | Per Element | Heap Used |
 |-----------|-------|-------------|-----------|
-| **SBA / BWSPI** | **6.71 ms** | **6 ns** | **15.94 MB (2.1x)** |
+| **BWSPI** | **6.71 ms** | **6 ns** | **15.94 MB (2.1x)** |
 | HashMap (std) | 31.91 ms | 31 ns | 34.00 MB (4.5x) |
 | Vec (append) | 1.90 ms | 1 ns | 7.63 MB (1.0x) |
 
@@ -96,7 +108,7 @@ BWSPI partitions data into bit-width buckets, reducing search space dramatically
 
 ## SIMD Acceleration
 
-SBA includes optional AVX2 SIMD-accelerated bucket scans in [`simd_search.rs`](src/simd_search.rs):
+BWSPI includes optional AVX2 SIMD-accelerated bucket scans in [`simd_search.rs`](src/simd_search.rs):
 
 ```
 1. Broadcast target → [target, target, target, target]  (VPBROADCASTQ)
@@ -107,6 +119,8 @@ SBA includes optional AVX2 SIMD-accelerated bucket scans in [`simd_search.rs`](s
 ```
 
 Runtime feature detection with scalar fallback — works on all x86-64 hardware.
+
+> **When does SIMD actually help?** At small bucket sizes (< ~16 entries), the compiler auto-vectorizes the scalar loop just as well. Manual AVX2 shines when buckets grow large (100+ entries) — specifically uniform-width distributions where most data lands in one bucket. See [docs/simd.md](docs/simd.md) for the full intrinsics breakdown.
 
 ---
 
@@ -152,7 +166,7 @@ println!("Heap usage: {} bytes", bulk.memory_usage_bytes());
 
 ---
 
-## When to Use SBA / BWSPI
+## When to Use BWSPI
 
 ### ✅ Great for
 
@@ -258,6 +272,15 @@ RUSTFLAGS="-C target-cpu=native" cargo run --release
 RUSTFLAGS="-C target-cpu=native" cargo bench --bench simd_bench
 RUSTFLAGS="-C target-cpu=native" cargo bench --bench bwspi_benchmarks
 ```
+
+---
+
+## Roadmap
+
+- [ ] **Generic integer support** — `u32`, `u16`, `usize` via trait-based `BitWidth` interface
+- [ ] **`no_std` support** — core implementation has no std dependency, needs feature gate
+- [ ] **Parallel insertion** — lock-free append with per-bucket atomics
+- [ ] **Persistent storage** — mmap-backed data store for zero-copy reload
 
 ---
 

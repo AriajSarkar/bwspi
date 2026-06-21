@@ -16,9 +16,7 @@
 //! 6. **Scale** — 1K, 10K, 100K, 1M elements
 
 use ahash::AHashMap;
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use hashbrown::HashMap as SwissMap;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -69,9 +67,9 @@ fn gen_sequential(n: usize) -> Vec<u64> {
 fn gen_clustered(n: usize, seed: u64) -> Vec<u64> {
     let mut rng = StdRng::seed_from_u64(seed);
     let clusters: Vec<(u64, u64)> = vec![
-        (100, 200),             // 8-bit range
-        (10_000, 20_000),       // 14-15 bit range
-        (1_000_000, 2_000_000), // 20-21 bit range
+        (100, 200),                           // 8-bit range
+        (10_000, 20_000),                     // 14-15 bit range
+        (1_000_000, 2_000_000),               // 20-21 bit range
         (1u64 << 40, (1u64 << 40) + 100_000), // 40-bit range
         (1u64 << 60, (1u64 << 60) + 100_000), // 60-bit range
     ];
@@ -90,7 +88,7 @@ fn gen_clustered(n: usize, seed: u64) -> Vec<u64> {
 /// Linear search on a raw Vec — baseline comparison.
 #[inline]
 fn linear_search(data: &[u64], target: u64) -> bool {
-    data.iter().any(|&v| v == target)
+    data.contains(&target)
 }
 
 // ---------------------------------------------------------------------------
@@ -265,13 +263,9 @@ fn bench_lookup_hit(c: &mut Criterion) {
             // AHashMap
             let ahash_map: AHashMap<u64, usize> =
                 data.iter().enumerate().map(|(i, &v)| (v, i)).collect();
-            group.bench_with_input(
-                BenchmarkId::new("hashmap_ahash", size),
-                &target,
-                |b, &t| {
-                    b.iter(|| black_box(ahash_map.get(&black_box(t))));
-                },
-            );
+            group.bench_with_input(BenchmarkId::new("hashmap_ahash", size), &target, |b, &t| {
+                b.iter(|| black_box(ahash_map.get(&black_box(t))));
+            });
 
             // FxHashMap
             let fx_map: FxHashMap<u64, usize> =
@@ -371,7 +365,9 @@ fn bench_mixed_workload(c: &mut Criterion) {
             for (i, &v) in data.iter().enumerate() {
                 bwspi.insert(black_box(v));
                 if i % 2 == 1 {
-                    black_box(bwspi.contains(black_box(lookup_targets[lt_idx % lookup_targets.len()])));
+                    black_box(
+                        bwspi.contains(black_box(lookup_targets[lt_idx % lookup_targets.len()])),
+                    );
                     lt_idx += 1;
                 }
             }
@@ -417,7 +413,10 @@ fn bench_mixed_workload(c: &mut Criterion) {
             for (i, &v) in data.iter().enumerate() {
                 vec.push(black_box(v));
                 if i % 2 == 1 {
-                    black_box(linear_search(&vec, black_box(lookup_targets[lt_idx % lookup_targets.len()])));
+                    black_box(linear_search(
+                        &vec,
+                        black_box(lookup_targets[lt_idx % lookup_targets.len()]),
+                    ));
                     lt_idx += 1;
                 }
             }

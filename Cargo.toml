@@ -28,6 +28,10 @@ harness = false
 name = "simd_bench"
 harness = false
 
+[[bin]]
+name = "hardware_bench"
+path = "hardware_bench.rs"
+
 [profile.bench]
 opt-level = 3
 lto = "thin"

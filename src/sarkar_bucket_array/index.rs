@@ -262,7 +262,15 @@ impl Bwspi {
         let old = self.data[index];
         let old_width = bit_width(old);
         let new_width = bit_width(new);
-        if old_width == new_width {
+        let needs_rebucket = if old_width != new_width {
+            true
+        } else if self.sub_buckets[old_width].is_some() {
+            Self::sub_index(old, old_width) != Self::sub_index(new, new_width)
+        } else {
+            false
+        };
+
+        if !needs_rebucket {
             self.data[index] = new;
             return true;
         }

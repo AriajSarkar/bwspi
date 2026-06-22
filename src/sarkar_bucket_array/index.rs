@@ -118,7 +118,8 @@ impl Bwspi {
     #[inline]
     fn split_bucket(&mut self, width: usize) {
         let mut subs: [Vec<usize>; 8] = Default::default();
-        for index in self.buckets[width].drain(..) {
+        let old_bucket = std::mem::take(&mut self.buckets[width]);
+        for index in old_bucket {
             let s_idx = Self::sub_index(self.data[index], width);
             self.bucket_positions[index] = subs[s_idx].len();
             subs[s_idx].push(index);

@@ -28,6 +28,7 @@ pub struct BucketStats {
 pub struct Bwspi {
     pub(crate) data: Vec<u64>,
     pub(crate) buckets: Vec<Vec<usize>>,
+    pub(crate) sub_buckets: Vec<Option<[Vec<usize>; 8]>>,
     /// For a live storage ID: its offset in its bit-width bucket. Deleted
     /// entries use `REMOVED_POSITION`.
     pub(crate) bucket_positions: Vec<usize>,
@@ -47,8 +48,27 @@ impl Bwspi {
         Self {
             data: Vec::with_capacity(capacity),
             buckets: Vec::new(),
+            sub_buckets: Vec::new(),
             bucket_positions: Vec::with_capacity(capacity),
             live_len: 0,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn sub_index(value: u64, bw: usize) -> usize {
+        (value >> bw.saturating_sub(4)) as usize & 0b111
+    }
+
+    #[inline]
+    pub(crate) fn target_bucket_slice(&self, target: u64) -> &[usize] {
+        let width = bit_width(target);
+        if width >= self.buckets.len() {
+            return &[];
+        }
+        if let Some(subs) = &self.sub_buckets[width] {
+            &subs[Self::sub_index(target, width)]
+        } else {
+            &self.buckets[width]
         }
     }
 
@@ -56,27 +76,54 @@ impl Bwspi {
     fn ensure_bucket(&mut self, width: usize) {
         if width >= self.buckets.len() {
             self.buckets.resize_with(width + 1, Vec::new);
+            self.sub_buckets.resize_with(width + 1, || None);
+        }
+    }
+
+    #[inline]
+    fn logical_bucket_is_empty(&self, width: usize) -> bool {
+        if let Some(subs) = &self.sub_buckets[width] {
+            subs.iter().all(|s| s.is_empty())
+        } else {
+            self.buckets[width].is_empty()
         }
     }
 
     #[inline]
     pub(crate) fn shrink_trailing(&mut self) {
-        while self.buckets.last().is_some_and(Vec::is_empty) {
+        while !self.buckets.is_empty() && self.logical_bucket_is_empty(self.buckets.len() - 1) {
             self.buckets.pop();
+            self.sub_buckets.pop();
         }
-    }
-
-    #[inline]
-    fn get_bucket(&self, width: usize) -> &[usize] {
-        self.buckets.get(width).map_or(&[], Vec::as_slice)
     }
 
     #[inline]
     fn link_existing(&mut self, index: usize, width: usize) {
         self.ensure_bucket(width);
-        let bucket = &mut self.buckets[width];
-        self.bucket_positions[index] = bucket.len();
-        bucket.push(index);
+        if let Some(subs) = &mut self.sub_buckets[width] {
+            let s_idx = Self::sub_index(self.data[index], width);
+            let bucket = &mut subs[s_idx];
+            self.bucket_positions[index] = bucket.len();
+            bucket.push(index);
+        } else {
+            let bucket = &mut self.buckets[width];
+            self.bucket_positions[index] = bucket.len();
+            bucket.push(index);
+            if bucket.len() > 64 {
+                self.split_bucket(width);
+            }
+        }
+    }
+
+    #[inline]
+    fn split_bucket(&mut self, width: usize) {
+        let mut subs: [Vec<usize>; 8] = Default::default();
+        for index in self.buckets[width].drain(..) {
+            let s_idx = Self::sub_index(self.data[index], width);
+            self.bucket_positions[index] = subs[s_idx].len();
+            subs[s_idx].push(index);
+        }
+        self.sub_buckets[width] = Some(subs);
     }
 
     /// Removes an already-validated live ID from its bucket without changing
@@ -86,7 +133,15 @@ impl Bwspi {
         let position = self.bucket_positions[index];
         debug_assert_ne!(position, REMOVED_POSITION);
 
-        let moved = {
+        let value = self.data[index];
+        let moved = if let Some(subs) = &mut self.sub_buckets[width] {
+            let s_idx = Self::sub_index(value, width);
+            let bucket = &mut subs[s_idx];
+            debug_assert_eq!(bucket[position], index);
+            let moved = *bucket.last().expect("live entry has a bucket slot");
+            bucket.swap_remove(position);
+            moved
+        } else {
             let bucket = &mut self.buckets[width];
             debug_assert_eq!(bucket[position], index);
             let moved = *bucket.last().expect("live entry has a bucket slot");
@@ -125,7 +180,7 @@ impl Bwspi {
     /// Returns whether a live copy of `target` exists.
     #[inline]
     pub fn contains(&self, target: u64) -> bool {
-        self.get_bucket(bit_width(target))
+        self.target_bucket_slice(target)
             .iter()
             .any(|&index| self.data[index] == target)
     }
@@ -133,7 +188,7 @@ impl Bwspi {
     /// Returns the first live storage ID containing `target`.
     #[inline]
     pub fn find(&self, target: u64) -> Option<usize> {
-        self.get_bucket(bit_width(target))
+        self.target_bucket_slice(target)
             .iter()
             .copied()
             .find(|&index| self.data[index] == target)
@@ -142,7 +197,7 @@ impl Bwspi {
     /// Returns every live storage ID containing `target`.
     #[must_use]
     pub fn find_all(&self, target: u64) -> Vec<usize> {
-        self.get_bucket(bit_width(target))
+        self.target_bucket_slice(target)
             .iter()
             .copied()
             .filter(|&index| self.data[index] == target)
@@ -160,9 +215,8 @@ impl Bwspi {
     /// The historical value remains in `data()`, but all public lookup APIs
     /// stop exposing it. The bucket unlink itself is O(1).
     pub fn remove(&mut self, target: u64) -> bool {
-        let width = bit_width(target);
         let index = self
-            .get_bucket(width)
+            .target_bucket_slice(target)
             .iter()
             .copied()
             .find(|&index| self.data[index] == target);
@@ -282,47 +336,45 @@ impl Bwspi {
             .filter(|(index, _)| self.bucket_positions[*index] != REMOVED_POSITION)
     }
 
-    /// Returns data-store IDs in a given bit-width bucket.
-    #[inline]
-    pub fn bucket_indices(&self, width: usize) -> &[usize] {
-        self.get_bucket(width)
-    }
-
     #[inline]
     pub fn bucket_slots(&self) -> usize {
         self.buckets.len()
     }
 
     pub fn active_bucket_count(&self) -> usize {
-        self.buckets
-            .iter()
-            .filter(|bucket| !bucket.is_empty())
+        (0..self.buckets.len())
+            .filter(|&w| !self.logical_bucket_is_empty(w))
             .count()
     }
 
     pub fn max_bucket_size(&self) -> usize {
-        self.buckets.iter().map(Vec::len).max().unwrap_or(0)
+        (0..self.buckets.len())
+            .map(|w| self.bucket_size(w))
+            .max()
+            .unwrap_or(0)
     }
 
     #[inline]
     pub fn bucket_size(&self, width: usize) -> usize {
-        self.get_bucket(width).len()
+        if let Some(subs) = &self.sub_buckets[width] {
+            subs.iter().map(|s| s.len()).sum()
+        } else {
+            self.buckets[width].len()
+        }
     }
 
     #[must_use]
     pub fn distribution_stats(&self) -> Vec<BucketStats> {
         let total = self.live_len as f64;
-        self.buckets
-            .iter()
-            .enumerate()
-            .filter(|(_, bucket)| !bucket.is_empty())
-            .map(|(width, bucket)| BucketStats {
+        (0..self.buckets.len())
+            .filter(|&w| !self.logical_bucket_is_empty(w))
+            .map(|width| BucketStats {
                 bit_width: width,
-                count: bucket.len(),
+                count: self.bucket_size(width),
                 percentage: if total == 0.0 {
                     0.0
                 } else {
-                    bucket.len() as f64 / total * 100.0
+                    self.bucket_size(width) as f64 / total * 100.0
                 },
             })
             .collect()
@@ -340,7 +392,15 @@ impl Bwspi {
             .iter()
             .map(|bucket| bucket.capacity() * std::mem::size_of::<usize>())
             .sum();
-        data_bytes + position_bytes + outer_bytes + inner_bytes
+            
+        let sub_outer = self.sub_buckets.capacity() * std::mem::size_of::<Option<[Vec<usize>; 8]>>();
+        let sub_inner: usize = self.sub_buckets.iter()
+            .filter_map(|s| s.as_ref())
+            .flat_map(|arr| arr.iter())
+            .map(|v| v.capacity() * std::mem::size_of::<usize>())
+            .sum();
+
+        data_bytes + position_bytes + outer_bytes + inner_bytes + sub_outer + sub_inner
     }
 }
 

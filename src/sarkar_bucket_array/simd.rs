@@ -1,13 +1,13 @@
 //! Optional AVX2 scan for a BWSPI bucket, with a portable scalar fallback.
 
-use super::{bit_width, Bwspi};
+use super::Bwspi;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
 /// Searches one routed bucket using AVX2 when available.
 pub fn simd_contains(index: &Bwspi, target: u64) -> bool {
-    let bucket = index.bucket_indices(bit_width(target));
+    let bucket = index.target_bucket_slice(target);
     if bucket.is_empty() {
         return false;
     }

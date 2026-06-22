@@ -27,22 +27,43 @@ pub(crate) fn sort_in_place(index: &mut Bwspi) -> SarkarSortStats {
 
     // Phase A: BWSPI already establishes globally ordered bit-width regions.
     // Sort only their pointer arrays. No second data array is created.
-    for bucket in &mut index.buckets {
-        if bucket.len() > 1 {
-            stats.buckets_sorted += 1;
-            sort_bucket_by_midpoint(&index.data, bucket, &mut stats);
-        } else if !bucket.is_empty() {
-            stats.buckets_sorted += 1;
+    for width in 0..index.buckets.len() {
+        if let Some(subs) = &mut index.sub_buckets[width] {
+            for sub in subs {
+                if sub.len() > 1 {
+                    stats.buckets_sorted += 1;
+                    sort_bucket_by_midpoint(&index.data, sub, &mut stats);
+                } else if !sub.is_empty() {
+                    stats.buckets_sorted += 1;
+                }
+            }
+        } else {
+            let bucket = &mut index.buckets[width];
+            if bucket.len() > 1 {
+                stats.buckets_sorted += 1;
+                sort_bucket_by_midpoint(&index.data, bucket, &mut stats);
+            } else if !bucket.is_empty() {
+                stats.buckets_sorted += 1;
+            }
         }
     }
 
     // Phase B: the sorted bucket pointers describe the desired global order.
     // Reuse the existing position map as old-location -> new-location mapping.
     let mut destination = 0usize;
-    for bucket in &index.buckets {
-        for &source in bucket {
-            index.bucket_positions[source] = destination;
-            destination += 1;
+    for width in 0..index.buckets.len() {
+        if let Some(subs) = &index.sub_buckets[width] {
+            for sub in subs {
+                for &source in sub {
+                    index.bucket_positions[source] = destination;
+                    destination += 1;
+                }
+            }
+        } else {
+            for &source in &index.buckets[width] {
+                index.bucket_positions[source] = destination;
+                destination += 1;
+            }
         }
     }
     debug_assert_eq!(destination, index.live_len);
@@ -70,14 +91,27 @@ pub(crate) fn sort_in_place(index: &mut Bwspi) -> SarkarSortStats {
     // Phase C: rebind the *existing* bucket pointer slots to their new data
     // locations. Buckets have the same lengths/capacities; only values change.
     let mut start = 0usize;
-    for (width, bucket) in index.buckets.iter_mut().enumerate() {
-        for (offset, storage_id) in bucket.iter_mut().enumerate() {
-            let location = start + offset;
-            debug_assert_eq!(bit_width(index.data[location]), width);
-            *storage_id = location;
-            index.bucket_positions[location] = offset;
+    for width in 0..index.buckets.len() {
+        if let Some(subs) = &mut index.sub_buckets[width] {
+            for sub in subs {
+                for (offset, storage_id) in sub.iter_mut().enumerate() {
+                    let location = start + offset;
+                    debug_assert_eq!(bit_width(index.data[location]), width);
+                    *storage_id = location;
+                    index.bucket_positions[location] = offset;
+                }
+                start += sub.len();
+            }
+        } else {
+            let bucket = &mut index.buckets[width];
+            for (offset, storage_id) in bucket.iter_mut().enumerate() {
+                let location = start + offset;
+                debug_assert_eq!(bit_width(index.data[location]), width);
+                *storage_id = location;
+                index.bucket_positions[location] = offset;
+            }
+            start += bucket.len();
         }
-        start += bucket.len();
     }
     debug_assert_eq!(start, index.live_len);
     for position in start..index.data.len() {

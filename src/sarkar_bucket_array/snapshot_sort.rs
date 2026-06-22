@@ -8,10 +8,18 @@ use super::Bwspi;
 pub(crate) fn sorted_snapshot(index: &Bwspi) -> Vec<u64> {
     let mut output = Vec::with_capacity(index.len());
 
-    for bucket in &index.buckets {
-        let start = output.len();
-        output.extend(bucket.iter().map(|&storage_id| index.data[storage_id]));
-        output[start..].sort_unstable();
+    for width in 0..index.buckets.len() {
+        if let Some(subs) = &index.sub_buckets[width] {
+            for sub in subs {
+                let start = output.len();
+                output.extend(sub.iter().map(|&storage_id| index.data[storage_id]));
+                output[start..].sort_unstable();
+            }
+        } else {
+            let start = output.len();
+            output.extend(index.buckets[width].iter().map(|&storage_id| index.data[storage_id]));
+            output[start..].sort_unstable();
+        }
     }
 
     output

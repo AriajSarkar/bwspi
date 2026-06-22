@@ -179,3 +179,33 @@ fn sarkar_sort_preserves_future_crud_correctness() {
     expected.sort_unstable();
     assert_eq!(index.sorted_snapshot(), expected);
 }
+
+#[test]
+fn sub_bucket_splitting_for_uniform_distribution() {
+    let mut index = Bwspi::new();
+    // Bucket 17 covers 65,536 to 131,071.
+    for i in 0..100 {
+        index.insert(65536 + i); // sub-bucket 0
+    }
+    for i in 0..100 {
+        index.insert(131071 - i); // sub-bucket 7
+    }
+    
+    // We should have split because we inserted 200 items in bucket 17.
+    assert!(index.sub_buckets[17].is_some());
+    assert!(index.buckets[17].is_empty());
+    
+    assert!(index.contains(65536 + 50));
+    assert!(index.contains(131071 - 50));
+    assert!(!index.contains(65536 + 150)); // Missing value
+    
+    // Check finding
+    assert!(index.find(65536 + 50).is_some());
+    assert!(index.find(100000).is_none());
+    
+    // Check sorting
+    let mut expected: Vec<_> = index.iter().map(|(_, value)| value).collect();
+    expected.sort_unstable();
+    index.sarkar_sort();
+    assert_eq!(&index.data()[..index.len()], expected);
+}

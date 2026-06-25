@@ -128,7 +128,7 @@ fn sarkar_sort_orders_live_values_and_rebinds_the_index() {
     for value in expected {
         let location = index.find(value).expect("sorted value remains indexed");
         assert_eq!(index.get(location), Some(value));
-        assert!(simd_contains(&index, value));
+        assert!(simd_contains(&mut index, value));
     }
     assert!(index.contains(42)); // one duplicate was intentionally retained
 }
@@ -181,29 +181,71 @@ fn sarkar_sort_preserves_future_crud_correctness() {
 }
 
 #[test]
-fn sub_bucket_splitting_for_uniform_distribution() {
+fn recursive_splitting_for_uniform_distribution() {
     let mut index = Bwspi::new();
     // Bucket 17 covers 65,536 to 131,071.
-    for i in 0..100 {
-        index.insert(65536 + i); // sub-bucket 0
+    for i in 0..200 {
+        index.insert(65536 + i);
     }
-    for i in 0..100 {
-        index.insert(131071 - i); // sub-bucket 7
-    }
-    
-    // We should have split because we inserted 200 items in bucket 17.
-    assert!(index.sub_buckets[17].is_some());
-    assert!(index.buckets[17].is_empty());
-    
+
+    // 200 items exceeds LEAF_CAP (64), so the tree for width 17 should
+    // have split into children (it's now a router, not a leaf).
+    // Trigger lazy tree build with a lookup first.
     assert!(index.contains(65536 + 50));
-    assert!(index.contains(131071 - 50));
-    assert!(!index.contains(65536 + 150)); // Missing value
-    
+    assert!(index.trees[17].has_split());
+
+    assert!(index.contains(65536 + 50));
+    assert!(index.contains(65536 + 150));
+    assert!(!index.contains(65536 + 250)); // Missing value
+
     // Check finding
     assert!(index.find(65536 + 50).is_some());
     assert!(index.find(100000).is_none());
-    
+
     // Check sorting
+    let mut expected: Vec<_> = index.iter().map(|(_, value)| value).collect();
+    expected.sort_unstable();
+    index.sarkar_sort();
+    assert_eq!(&index.data()[..index.len()], expected);
+}
+
+#[test]
+fn deep_recursive_split_stress_test() {
+    // Insert 10,000 elements in one bit-width bucket to trigger
+    // multiple levels of recursive splitting.
+    let mut index = Bwspi::new();
+    // All values in bit-width 32: range [2^31, 2^32 - 1]
+    for i in 0..10_000_u64 {
+        index.insert((1_u64 << 31) | i);
+    }
+
+    assert_eq!(index.len(), 10_000);
+    assert_eq!(index.bucket_size(32), 10_000);
+    // Trigger lazy tree build before checking structure.
+    assert!(index.contains((1_u64 << 31) | 0));
+    // The tree must have split recursively.
+    assert!(index.trees[32].has_split());
+    // Max depth should be > 1 (sub-of-sub splitting).
+    assert!(index.trees[32].max_depth() > 1,
+        "expected recursive splits, got depth {}",
+        index.trees[32].max_depth());
+
+    // Every value must be findable.
+    for i in 0..10_000_u64 {
+        let v = (1_u64 << 31) | i;
+        assert!(index.contains(v), "missing {v}");
+    }
+
+    // Remove half, verify the other half.
+    for i in (0..10_000_u64).step_by(2) {
+        assert!(index.remove((1_u64 << 31) | i));
+    }
+    assert_eq!(index.len(), 5_000);
+    for i in (1..10_000_u64).step_by(2) {
+        assert!(index.contains((1_u64 << 31) | i));
+    }
+
+    // Sorting still works.
     let mut expected: Vec<_> = index.iter().map(|(_, value)| value).collect();
     expected.sort_unstable();
     index.sarkar_sort();

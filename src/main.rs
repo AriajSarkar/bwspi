@@ -188,14 +188,18 @@ struct ColdHotResult {
     hot_avg: Duration,
 }
 
-fn cold_hot_search<F: Fn()>(f: F) -> ColdHotResult {
+fn cold_hot_search<F: FnMut()>(mut f: F) -> ColdHotResult {
     // Cold run
-    let cold = time_it(&f);
+    let start = Instant::now();
+    f();
+    let cold = start.elapsed();
 
     // Hot runs
     let mut total = Duration::ZERO;
     for _ in 0..HOT_ROUNDS {
-        total += time_it(&f);
+        let start = Instant::now();
+        f();
+        total += start.elapsed();
     }
     ColdHotResult {
         cold,

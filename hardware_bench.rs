@@ -166,7 +166,7 @@ fn run_stream_workloads(rows: &mut Vec<ResultRow>, label: &'static str, data: &[
         black_box(set.len());
     }));
 
-    let index = {
+    let mut index = {
         let mut value = Bwspi::with_capacity(data.len());
         value.insert_bulk(data);
         value
@@ -212,7 +212,7 @@ fn run_stream_workloads(rows: &mut Vec<ResultRow>, label: &'static str, data: &[
 
 fn run_sort_workloads(rows: &mut Vec<ResultRow>, label: &'static str, data: &[u64]) {
     let bytes = std::mem::size_of_val(data);
-    let snapshot_index = {
+    let mut snapshot_index = {
         let mut index = Bwspi::with_capacity(data.len());
         index.insert_bulk(data);
         index

@@ -2,16 +2,137 @@ use super::{sarkar_sort, snapshot_sort};
 
 const REMOVED_POSITION: usize = usize::MAX;
 
+// ── Recursive bucket tree constants ──────────────────────────────────
+
+const LEAF_CAP: usize = 64;
+const FANOUT: usize = 8;
+const FANOUT_BITS: usize = 3;
+
 /// Computes the binary bit-width of a `u64` value.
-///
-/// On CPUs exposing the relevant instruction this maps to a count-leading-zero
-/// instruction. The Rust implementation remains portable when it does not.
 #[inline(always)]
 pub fn bit_width(value: u64) -> usize {
     (u64::BITS - value.leading_zeros()) as usize
 }
 
-/// Per-bucket distribution statistics for *live* values.
+#[inline(always)]
+fn child_index(value: u64, bw: usize, depth: usize) -> usize {
+    let shift = bw.saturating_sub(FANOUT_BITS * (depth + 1) + 1);
+    (value >> shift) as usize & (FANOUT - 1)
+}
+
+// ── BucketNode (Lookup-only tree) ────────────────────────────────────
+//
+// Built lazily from the flat CRUD buckets. Rebuilt per-width only when
+// a lookup touches a dirty width.
+
+#[derive(Default)]
+pub(crate) struct BucketNode {
+    pub(crate) entries: Vec<usize>,
+    pub(crate) children: Option<Box<[BucketNode; FANOUT]>>,
+}
+
+impl BucketNode {
+    fn new() -> Self { Self::default() }
+
+    #[inline]
+    pub(crate) fn find_leaf(&self, value: u64, bw: usize) -> &[usize] {
+        let mut node = self;
+        let mut d = 0;
+        loop {
+            match &node.children {
+                None => return &node.entries,
+                Some(kids) => {
+                    node = &kids[child_index(value, bw, d)];
+                    d += 1;
+                }
+            }
+        }
+    }
+
+    /// Build tree from a flat list of storage IDs.
+    fn build_from(ids: &[usize], bw: usize, data: &[u64]) -> Self {
+        let mut root = BucketNode { entries: ids.to_vec(), children: None };
+        if root.entries.len() > LEAF_CAP {
+            root.tree_split(bw, 0, data);
+        }
+        root
+    }
+
+    fn tree_split(&mut self, bw: usize, depth: usize, data: &[u64]) {
+        if FANOUT_BITS * (depth + 1) >= bw.saturating_add(1) {
+            return;
+        }
+        let mut kids: [BucketNode; FANOUT] = std::array::from_fn(|_| BucketNode::new());
+        let old = std::mem::take(&mut self.entries);
+        for storage_id in old {
+            let ci = child_index(data[storage_id], bw, depth);
+            kids[ci].entries.push(storage_id);
+        }
+        self.children = Some(Box::new(kids));
+        if let Some(kids) = &mut self.children {
+            for kid in kids.iter_mut() {
+                if kid.entries.len() > LEAF_CAP {
+                    kid.tree_split(bw, depth + 1, data);
+                }
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn total_len(&self) -> usize {
+        match &self.children {
+            None => self.entries.len(),
+            Some(kids) => kids.iter().map(|k| k.total_len()).sum(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn all_empty(&self) -> bool {
+        match &self.children {
+            None => self.entries.is_empty(),
+            Some(kids) => kids.iter().all(|k| k.all_empty()),
+        }
+    }
+
+    pub(crate) fn for_each_leaf<F: FnMut(&Vec<usize>)>(&self, f: &mut F) {
+        match &self.children {
+            None => f(&self.entries),
+            Some(kids) => { for kid in kids.iter() { kid.for_each_leaf(f); } }
+        }
+    }
+
+    pub(crate) fn for_each_leaf_mut<F: FnMut(&mut Vec<usize>)>(&mut self, f: &mut F) {
+        match &mut self.children {
+            None => f(&mut self.entries),
+            Some(kids) => { for kid in kids.iter_mut() { kid.for_each_leaf_mut(f); } }
+        }
+    }
+
+    pub(crate) fn tree_overhead_bytes(&self) -> usize {
+        let own = self.entries.capacity() * std::mem::size_of::<usize>();
+        match &self.children {
+            None => own,
+            Some(kids) => {
+                own + std::mem::size_of::<[BucketNode; FANOUT]>()
+                    + kids.iter().map(|k| k.tree_overhead_bytes()).sum::<usize>()
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn has_split(&self) -> bool { self.children.is_some() }
+
+    #[allow(dead_code)]
+    pub(crate) fn max_depth(&self) -> usize {
+        match &self.children {
+            None => 0,
+            Some(kids) => 1 + kids.iter().map(|k| k.max_depth()).max().unwrap_or(0),
+        }
+    }
+}
+
+// ── Per-bucket statistics ────────────────────────────────────────────
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BucketStats {
     pub bit_width: usize,
@@ -19,410 +140,321 @@ pub struct BucketStats {
     pub percentage: f64,
 }
 
-/// A live-stream `u64` index routed by binary bit width.
-///
-/// `data` retains every inserted value so an insert's storage ID is stable
-/// until [`Bwspi::sarkar_sort`] is requested. Soft deletion only unlinks an ID
-/// from the bucket index. `bucket_positions` makes unlinking, rebucketing, and
-/// update operations O(1) after a matching ID has been located.
+// ── Bwspi (Dual-Index with Lazy Tree) ────────────────────────────────
+//
+//   crud_buckets — flat Vec<usize> per bit-width.
+//     ALL mutations go here: O(1) push, O(1) swap_remove.
+//     This is the source of truth.
+//
+//   trees — recursive BucketNode per bit-width.
+//     Built LAZILY from crud_buckets when a lookup needs it.
+//     NEVER touched during insert/remove/update.
+//     Rebuilt per-width when `tree_dirty[w]` is true.
+//
+//   tree_dirty — one bool per bit-width.
+//     Set true on any CRUD mutation. Cleared when tree is rebuilt.
+
 pub struct Bwspi {
     pub(crate) data: Vec<u64>,
-    pub(crate) buckets: Vec<Vec<usize>>,
-    pub(crate) sub_buckets: Vec<Option<[Vec<usize>; 8]>>,
-    /// For a live storage ID: its offset in its bit-width bucket. Deleted
-    /// entries use `REMOVED_POSITION`.
+
+    // ── CRUD index (flat, O(1) operations) ───────────────────────
+    pub(crate) crud_buckets: Vec<Vec<usize>>,
     pub(crate) bucket_positions: Vec<usize>,
+
+    // ── Lookup index (lazy tree, ≤64 per leaf) ───────────────────
+    pub(crate) trees: Vec<BucketNode>,
+    tree_dirty: Vec<bool>,
+
     pub(crate) live_len: usize,
 }
 
 impl Bwspi {
-    /// Creates an empty index.
     #[must_use]
-    pub fn new() -> Self {
-        Self::with_capacity(0)
-    }
+    pub fn new() -> Self { Self::with_capacity(0) }
 
-    /// Creates an empty index with capacity for storage entries.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             data: Vec::with_capacity(capacity),
-            buckets: Vec::new(),
-            sub_buckets: Vec::new(),
+            crud_buckets: Vec::new(),
             bucket_positions: Vec::with_capacity(capacity),
+            trees: Vec::new(),
+            tree_dirty: Vec::new(),
             live_len: 0,
         }
     }
 
-    #[inline(always)]
-    pub(crate) fn sub_index(value: u64, bw: usize) -> usize {
-        (value >> bw.saturating_sub(4)) as usize & 0b111
-    }
-
     #[inline]
-    pub(crate) fn target_bucket_slice(&self, target: u64) -> &[usize] {
-        let width = bit_width(target);
-        if width >= self.buckets.len() {
-            return &[];
-        }
-        if let Some(subs) = &self.sub_buckets[width] {
-            &subs[Self::sub_index(target, width)]
-        } else {
-            &self.buckets[width]
+    fn ensure_width(&mut self, width: usize) {
+        if width >= self.crud_buckets.len() {
+            self.crud_buckets.resize_with(width + 1, Vec::new);
+            self.trees.resize_with(width + 1, BucketNode::new);
+            self.tree_dirty.resize(width + 1, true);
         }
     }
 
+    // ── Lazy tree rebuild ────────────────────────────────────────
+    //
+    // Only rebuilds tree[w] when a lookup needs it and it's dirty.
+    // Cost: O(k) where k = crud_buckets[w].len(). Amortized over
+    // all lookups until the next mutation on that width.
+
     #[inline]
-    fn ensure_bucket(&mut self, width: usize) {
-        if width >= self.buckets.len() {
-            self.buckets.resize_with(width + 1, Vec::new);
-            self.sub_buckets.resize_with(width + 1, || None);
+    fn ensure_tree_clean(&mut self, width: usize) {
+        if width < self.tree_dirty.len() && self.tree_dirty[width] {
+            self.trees[width] = BucketNode::build_from(
+                &self.crud_buckets[width], width, &self.data
+            );
+            self.tree_dirty[width] = false;
         }
     }
 
+    // ── Lookup routing (uses tree, rebuilds lazily) ──────────────
+
+    /// Ensure tree is clean, then return immutable leaf slice.
+    /// Split into two steps to satisfy the borrow checker:
+    /// step 1: ensure_tree_clean(&mut self)  — mutable
+    /// step 2: route_clean(&self)            — immutable
     #[inline]
-    fn logical_bucket_is_empty(&self, width: usize) -> bool {
-        if let Some(subs) = &self.sub_buckets[width] {
-            subs.iter().all(|s| s.is_empty())
-        } else {
-            self.buckets[width].is_empty()
-        }
+    fn route_clean(&self, target: u64) -> &[usize] {
+        let w = bit_width(target);
+        if w >= self.trees.len() { return &[]; }
+        self.trees[w].find_leaf(target, w)
     }
 
     #[inline]
     pub(crate) fn shrink_trailing(&mut self) {
-        while !self.buckets.is_empty() && self.logical_bucket_is_empty(self.buckets.len() - 1) {
-            self.buckets.pop();
-            self.sub_buckets.pop();
+        while !self.crud_buckets.is_empty()
+            && self.crud_buckets.last().is_some_and(|b| b.is_empty())
+        {
+            self.crud_buckets.pop();
+            self.trees.pop();
+            self.tree_dirty.pop();
         }
     }
 
+    // ── CRUD (flat index only, O(1)) ─────────────────────────────
+    //
+    // These NEVER touch the tree. Just mark dirty.
+
     #[inline]
-    fn link_existing(&mut self, index: usize, width: usize) {
-        self.ensure_bucket(width);
-        if let Some(subs) = &mut self.sub_buckets[width] {
-            let s_idx = Self::sub_index(self.data[index], width);
-            let bucket = &mut subs[s_idx];
-            self.bucket_positions[index] = bucket.len();
-            bucket.push(index);
-        } else {
-            let bucket = &mut self.buckets[width];
-            self.bucket_positions[index] = bucket.len();
-            bucket.push(index);
-            if bucket.len() > 64 {
-                self.split_bucket(width);
-            }
-        }
+    fn crud_link(&mut self, index: usize, width: usize) {
+        self.ensure_width(width);
+        let bucket = &mut self.crud_buckets[width];
+        self.bucket_positions[index] = bucket.len();
+        bucket.push(index);
+        self.tree_dirty[width] = true; // tree stale
     }
 
     #[inline]
-    fn split_bucket(&mut self, width: usize) {
-        let mut subs: [Vec<usize>; 8] = Default::default();
-        let old_bucket = std::mem::take(&mut self.buckets[width]);
-        for index in old_bucket {
-            let s_idx = Self::sub_index(self.data[index], width);
-            self.bucket_positions[index] = subs[s_idx].len();
-            subs[s_idx].push(index);
-        }
-        self.sub_buckets[width] = Some(subs);
-    }
-
-    /// Removes an already-validated live ID from its bucket without changing
-    /// the data store or live count.
-    #[inline]
-    fn unlink_existing(&mut self, index: usize, width: usize) {
+    fn crud_unlink(&mut self, index: usize, width: usize) {
         let position = self.bucket_positions[index];
         debug_assert_ne!(position, REMOVED_POSITION);
-
-        let value = self.data[index];
-        let moved = if let Some(subs) = &mut self.sub_buckets[width] {
-            let s_idx = Self::sub_index(value, width);
-            let bucket = &mut subs[s_idx];
-            debug_assert_eq!(bucket[position], index);
-            let moved = *bucket.last().expect("live entry has a bucket slot");
-            bucket.swap_remove(position);
-            moved
-        } else {
-            let bucket = &mut self.buckets[width];
-            debug_assert_eq!(bucket[position], index);
-            let moved = *bucket.last().expect("live entry has a bucket slot");
-            bucket.swap_remove(position);
-            moved
-        };
-
+        let bucket = &mut self.crud_buckets[width];
+        let moved = *bucket.last().expect("live entry");
+        bucket.swap_remove(position);
         if moved != index {
             self.bucket_positions[moved] = position;
         }
         self.bucket_positions[index] = REMOVED_POSITION;
+        self.tree_dirty[width] = true; // tree stale
     }
 
-    // ── Live-stream CRUD ──────────────────────────────────────────────
+    // ── Live-stream CRUD ─────────────────────────────────────────
 
-    /// Inserts one value and returns its stable storage ID.
     #[inline]
     pub fn insert(&mut self, value: u64) -> usize {
         let index = self.data.len();
         self.data.push(value);
         self.bucket_positions.push(REMOVED_POSITION);
-        self.link_existing(index, bit_width(value));
+        self.crud_link(index, bit_width(value));
         self.live_len += 1;
         index
     }
 
-    /// Bulk-inserts a slice.
     pub fn insert_bulk(&mut self, values: &[u64]) {
         self.data.reserve(values.len());
         self.bucket_positions.reserve(values.len());
         for &value in values {
-            self.insert(value);
+            let index = self.data.len();
+            self.data.push(value);
+            self.bucket_positions.push(REMOVED_POSITION);
+            self.crud_link(index, bit_width(value));
+            self.live_len += 1;
         }
     }
 
-    /// Returns whether a live copy of `target` exists.
     #[inline]
-    pub fn contains(&self, target: u64) -> bool {
-        self.target_bucket_slice(target)
-            .iter()
-            .any(|&index| self.data[index] == target)
+    pub fn contains(&mut self, target: u64) -> bool {
+        self.ensure_tree_clean(bit_width(target));
+        let leaf = self.route_clean(target);
+        leaf.iter().any(|&id| self.data[id] == target)
     }
 
-    /// Returns the first live storage ID containing `target`.
     #[inline]
-    pub fn find(&self, target: u64) -> Option<usize> {
-        self.target_bucket_slice(target)
-            .iter()
-            .copied()
-            .find(|&index| self.data[index] == target)
+    pub fn find(&mut self, target: u64) -> Option<usize> {
+        self.ensure_tree_clean(bit_width(target));
+        let leaf = self.route_clean(target);
+        leaf.iter().copied().find(|&id| self.data[id] == target)
     }
 
-    /// Returns every live storage ID containing `target`.
     #[must_use]
-    pub fn find_all(&self, target: u64) -> Vec<usize> {
-        self.target_bucket_slice(target)
-            .iter()
-            .copied()
-            .filter(|&index| self.data[index] == target)
-            .collect()
+    pub fn find_all(&mut self, target: u64) -> Vec<usize> {
+        self.ensure_tree_clean(bit_width(target));
+        let leaf = self.route_clean(target);
+        leaf.iter().copied().filter(|&id| self.data[id] == target).collect()
     }
 
-    /// Returns the live value at `index`, if that storage ID is still active.
     #[inline]
     pub fn get(&self, index: usize) -> Option<u64> {
         (self.bucket_positions.get(index)? != &REMOVED_POSITION).then(|| self.data[index])
     }
 
-    /// Soft-deletes the first live occurrence of `target`.
-    ///
-    /// The historical value remains in `data()`, but all public lookup APIs
-    /// stop exposing it. The bucket unlink itself is O(1).
     pub fn remove(&mut self, target: u64) -> bool {
-        let index = self
-            .target_bucket_slice(target)
-            .iter()
-            .copied()
-            .find(|&index| self.data[index] == target);
-        index.is_some_and(|index| self.remove_at(index))
+        self.ensure_tree_clean(bit_width(target));
+        let index = {
+            let leaf = self.route_clean(target);
+            leaf.iter().copied().find(|&id| self.data[id] == target)
+        };
+        index.is_some_and(|i| self.remove_at(i))
     }
 
-    /// Soft-deletes an exact live storage ID in O(1).
     pub fn remove_at(&mut self, index: usize) -> bool {
-        let Some(&position) = self.bucket_positions.get(index) else {
-            return false;
-        };
-        if position == REMOVED_POSITION {
-            return false;
-        }
-
+        let Some(&position) = self.bucket_positions.get(index) else { return false };
+        if position == REMOVED_POSITION { return false; }
         let width = bit_width(self.data[index]);
-        self.unlink_existing(index, width);
+        self.crud_unlink(index, width); // O(1), marks tree dirty
         self.live_len -= 1;
         self.shrink_trailing();
         true
     }
 
-    /// Replaces the first live `old` value with `new`, returning whether a
-    /// value was updated. This is O(k) to locate `old`, then O(1) to rebucket.
     pub fn update(&mut self, old: u64, new: u64) -> bool {
-        self.find(old)
-            .is_some_and(|index| self.update_at(index, new))
+        self.ensure_tree_clean(bit_width(old));
+        let index = {
+            let leaf = self.route_clean(old);
+            leaf.iter().copied().find(|&id| self.data[id] == old)
+        };
+        index.is_some_and(|i| self.update_at(i, new))
     }
 
-    /// Replaces the live value at an exact storage ID.
-    ///
-    /// Updating inside the same bit-width bucket is one store. Crossing a
-    /// bit-width boundary unlinks and relinks the existing ID in O(1), rather
-    /// than rescanning the old bucket to repair its position.
     pub fn update_at(&mut self, index: usize, new: u64) -> bool {
-        let Some(&position) = self.bucket_positions.get(index) else {
-            return false;
-        };
-        if position == REMOVED_POSITION {
-            return false;
-        }
+        let Some(&position) = self.bucket_positions.get(index) else { return false };
+        if position == REMOVED_POSITION { return false; }
 
         let old = self.data[index];
         let old_width = bit_width(old);
         let new_width = bit_width(new);
-        let needs_rebucket = if old_width != new_width {
-            true
-        } else if self.sub_buckets[old_width].is_some() {
-            Self::sub_index(old, old_width) != Self::sub_index(new, new_width)
-        } else {
-            false
-        };
 
-        if !needs_rebucket {
+        if old_width == new_width {
+            // Same width — just update the data.
+            // Flat index: same bucket, same position — nothing to do.
+            // Tree: mark dirty (will rebuild on next lookup).
             self.data[index] = new;
+            self.tree_dirty[old_width] = true;
             return true;
         }
 
-        self.unlink_existing(index, old_width);
+        // Different width — rebucket in flat index only.
+        self.crud_unlink(index, old_width); // O(1)
         self.data[index] = new;
-        self.link_existing(index, new_width);
+        self.crud_link(index, new_width);   // O(1)
         self.shrink_trailing();
         true
     }
 
-    // ── Sorting ───────────────────────────────────────────────────────
+    // ── Sorting ──────────────────────────────────────────────────
 
-    /// Produces an ascending, independently allocated snapshot of live data.
-    ///
-    /// Whole bit-width buckets are already globally ordered, so only the
-    /// values collected from each individual bucket need sorting. This leaves
-    /// storage IDs and the streaming index untouched.
     #[must_use]
-    pub fn sorted_snapshot(&self) -> Vec<u64> {
+    pub fn sorted_snapshot(&mut self) -> Vec<u64> {
+        // Ensure all trees are clean before snapshot.
+        self.rebuild_all_dirty();
         snapshot_sort::sorted_snapshot(self)
     }
 
-    /// Runs Sarkar Sort over the internal storage without allocating a second
-    /// data array. See [`SarkarSortStats`] for work performed.
-    ///
-    /// This changes physical storage order, so IDs previously returned by
-    /// `insert`, `find`, or `find_all` must be treated as invalid afterwards.
-    /// Use [`Bwspi::sorted_snapshot`] when stable IDs are required.
     pub fn sarkar_sort(&mut self) -> super::SarkarSortStats {
+        self.rebuild_all_dirty();
         sarkar_sort::sort_in_place(self)
     }
 
-    /// Alias for [`Bwspi::sarkar_sort`].
     #[inline]
-    pub fn sort_in_place(&mut self) -> super::SarkarSortStats {
-        self.sarkar_sort()
+    pub fn sort_in_place(&mut self) -> super::SarkarSortStats { self.sarkar_sort() }
+
+    /// Rebuild all dirty trees. Called before sort/snapshot.
+    fn rebuild_all_dirty(&mut self) {
+        for w in 0..self.tree_dirty.len() {
+            if self.tree_dirty[w] {
+                self.trees[w] = BucketNode::build_from(
+                    &self.crud_buckets[w], w, &self.data
+                );
+                self.tree_dirty[w] = false;
+            }
+        }
     }
 
-    // ── Observability ─────────────────────────────────────────────────
+    // ── Observability ────────────────────────────────────────────
 
-    /// Number of live values visible to search and sort operations.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.live_len
-    }
+    #[inline] pub fn len(&self) -> usize { self.live_len }
+    #[inline] pub fn storage_len(&self) -> usize { self.data.len() }
+    #[inline] pub fn is_empty(&self) -> bool { self.live_len == 0 }
+    #[inline] pub fn data(&self) -> &[u64] { &self.data }
 
-    /// Number of historical storage entries, including soft-deleted values.
-    #[inline]
-    pub fn storage_len(&self) -> usize {
-        self.data.len()
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.live_len == 0
-    }
-
-    /// Returns all historical storage, including values removed by soft delete.
-    #[inline]
-    pub fn data(&self) -> &[u64] {
-        &self.data
-    }
-
-    /// Iterates `(storage_id, value)` pairs for live entries only.
     pub fn iter(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
-        self.data
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(|(index, _)| self.bucket_positions[*index] != REMOVED_POSITION)
+        self.data.iter().copied().enumerate()
+            .filter(|(i, _)| self.bucket_positions[*i] != REMOVED_POSITION)
     }
 
-    #[inline]
-    pub fn bucket_slots(&self) -> usize {
-        self.buckets.len()
-    }
+    #[inline] pub fn bucket_slots(&self) -> usize { self.crud_buckets.len() }
 
     pub fn active_bucket_count(&self) -> usize {
-        (0..self.buckets.len())
-            .filter(|&w| !self.logical_bucket_is_empty(w))
-            .count()
+        self.crud_buckets.iter().filter(|b| !b.is_empty()).count()
     }
 
     pub fn max_bucket_size(&self) -> usize {
-        (0..self.buckets.len())
-            .map(|w| self.bucket_size(w))
-            .max()
-            .unwrap_or(0)
+        self.crud_buckets.iter().map(|b| b.len()).max().unwrap_or(0)
     }
 
     #[inline]
     pub fn bucket_size(&self, width: usize) -> usize {
-        if let Some(subs) = &self.sub_buckets[width] {
-            subs.iter().map(|s| s.len()).sum()
-        } else {
-            self.buckets[width].len()
-        }
+        if width < self.crud_buckets.len() { self.crud_buckets[width].len() } else { 0 }
     }
 
     #[must_use]
     pub fn distribution_stats(&self) -> Vec<BucketStats> {
         let total = self.live_len as f64;
-        (0..self.buckets.len())
-            .filter(|&w| !self.logical_bucket_is_empty(w))
-            .map(|width| BucketStats {
-                bit_width: width,
-                count: self.bucket_size(width),
-                percentage: if total == 0.0 {
-                    0.0
-                } else {
-                    self.bucket_size(width) as f64 / total * 100.0
-                },
+        (0..self.crud_buckets.len())
+            .filter(|&w| !self.crud_buckets[w].is_empty())
+            .map(|width| {
+                let count = self.crud_buckets[width].len();
+                BucketStats {
+                    bit_width: width,
+                    count,
+                    percentage: if total == 0.0 { 0.0 } else { count as f64 / total * 100.0 },
+                }
             })
             .collect()
     }
 
-    /// Estimated heap bytes owned by the index. This excludes allocator
-    /// metadata and includes the O(n) position map used for O(1) updates.
     #[must_use]
     pub fn memory_usage_bytes(&self) -> usize {
-        let data_bytes = self.data.capacity() * std::mem::size_of::<u64>();
-        let position_bytes = self.bucket_positions.capacity() * std::mem::size_of::<usize>();
-        let outer_bytes = self.buckets.capacity() * std::mem::size_of::<Vec<usize>>();
-        let inner_bytes: usize = self
-            .buckets
-            .iter()
-            .map(|bucket| bucket.capacity() * std::mem::size_of::<usize>())
-            .sum();
-            
-        let sub_outer = self.sub_buckets.capacity() * std::mem::size_of::<Option<[Vec<usize>; 8]>>();
-        let sub_inner: usize = self.sub_buckets.iter()
-            .filter_map(|s| s.as_ref())
-            .flat_map(|arr| arr.iter())
-            .map(|v| v.capacity() * std::mem::size_of::<usize>())
-            .sum();
-
-        data_bytes + position_bytes + outer_bytes + inner_bytes + sub_outer + sub_inner
+        let data_bytes = self.data.capacity() * 8;
+        let pos_bytes = self.bucket_positions.capacity() * 8;
+        let crud_outer = self.crud_buckets.capacity() * std::mem::size_of::<Vec<usize>>();
+        let crud_inner: usize = self.crud_buckets.iter().map(|b| b.capacity() * 8).sum();
+        let tree_outer = self.trees.capacity() * std::mem::size_of::<BucketNode>();
+        let tree_inner: usize = self.trees.iter().map(|t| t.tree_overhead_bytes()).sum();
+        let dirty_bytes = self.tree_dirty.capacity();
+        data_bytes + pos_bytes + crud_outer + crud_inner + tree_outer + tree_inner + dirty_bytes
     }
 }
 
 impl Default for Bwspi {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl std::fmt::Debug for Bwspi {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("Bwspi")
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Bwspi")
             .field("live_elements", &self.live_len)
             .field("storage_entries", &self.data.len())
             .field("slots", &self.bucket_slots())

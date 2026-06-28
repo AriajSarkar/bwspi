@@ -99,18 +99,15 @@ impl BucketNode {
         }
     }
 
-    /// Build tree from a flat list of storage IDs.
-    ///
-    /// Fix 1: Only build fast_table for buckets with > LEAF_CAP entries.
-    ///        Small buckets use linear scan — ≤64 entries fit in L1 cache.
-    /// Fix 2: No more `values: Vec<u64>` — reads from data[] directly.
-    /// Fix 3: Load factor ~70% instead of 50% → (k * 10/7).next_power_of_two()
-    ///        giving ~2.17 avg probes on hit, ~6.06 on miss.
-    fn build_from(ids: &[usize], bw: usize, data: &[u64]) -> Self {
+    fn build_from(ids: &[usize], bw: usize, data: &[u64], load_factor: f64) -> Self {
         // Fix 1: only build fast_table for large buckets
         let fast_table = if ids.len() > LEAF_CAP {
-            // Fix 3: ~70% load factor (was 50%)
-            let cap = (ids.len() * 10 / 7).next_power_of_two().max(8);
+            // Apply configurable load factor
+            let min_cap = ids.len() + 1; // Absolute minimum to avoid infinite loops
+            // clamp load factor between 0.01 and 10.0 to prevent panic/OOM
+            let lf = load_factor.clamp(0.01, 10.0);
+            let target_cap = (ids.len() as f64 / lf).ceil() as usize;
+            let cap = target_cap.max(min_cap).next_power_of_two().max(8);
             let mut table = vec![(u64::MAX, usize::MAX); cap];
             let mask = cap - 1;
             for &id in ids {
@@ -258,6 +255,8 @@ pub struct Bwspi {
     pub(crate) tree_dirty: Vec<bool>,
 
     pub(crate) live_len: usize,
+    /// Target load factor for the fast_table lookup accelerator. Defaults to 0.7.
+    pub load_factor: f64,
 }
 
 impl Bwspi {
@@ -273,6 +272,26 @@ impl Bwspi {
             trees: Vec::new(),
             tree_dirty: Vec::new(),
             live_len: 0,
+            load_factor: 0.7,
+        }
+    }
+
+    /// Builder method to configure the fast_table load factor.
+    /// Lower values (e.g. 0.5) use more memory but are faster.
+    /// Higher values (e.g. 0.99) save memory but increase lookup collisions.
+    /// Defaults to 0.7 (~70% load factor).
+    #[must_use]
+    pub fn with_load_factor(mut self, load_factor: f64) -> Self {
+        self.load_factor = load_factor;
+        self
+    }
+
+    /// Update the fast_table load factor. Affects future index rebuilds.
+    pub fn set_load_factor(&mut self, load_factor: f64) {
+        self.load_factor = load_factor;
+        // Mark all active trees as dirty so they rebuild with the new factor on next use.
+        for dirty in self.tree_dirty.iter_mut() {
+            *dirty = true;
         }
     }
 
@@ -295,7 +314,7 @@ impl Bwspi {
     fn ensure_tree_clean(&mut self, width: usize) {
         if width < self.tree_dirty.len() && self.tree_dirty[width] {
             self.trees[width] = BucketNode::build_from(
-                &self.crud_buckets[width], width, &self.data
+                &self.crud_buckets[width], width, &self.data, self.load_factor
             );
             self.tree_dirty[width] = false;
         }
@@ -541,7 +560,7 @@ impl Bwspi {
         for w in 0..self.tree_dirty.len() {
             if self.tree_dirty[w] {
                 self.trees[w] = BucketNode::build_from(
-                    &self.crud_buckets[w], w, &self.data
+                    &self.crud_buckets[w], w, &self.data, self.load_factor
                 );
                 self.tree_dirty[w] = false;
             }

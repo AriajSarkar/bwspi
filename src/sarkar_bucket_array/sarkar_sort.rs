@@ -83,6 +83,9 @@ pub(crate) fn sort_in_place(index: &mut Bwspi) -> SarkarSortStats {
         index.bucket_positions[position] = usize::MAX;
     }
     index.shrink_trailing();
+    for dirty in index.tree_dirty.iter_mut() {
+        *dirty = true;
+    }
 
     stats
 }

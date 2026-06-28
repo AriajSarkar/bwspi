@@ -14,6 +14,7 @@ pub fn bit_width(value: u64) -> usize {
     (u64::BITS - value.leading_zeros()) as usize
 }
 
+#[allow(dead_code)]
 #[inline(always)]
 fn child_index(value: u64, bw: usize, depth: usize) -> usize {
     let shift = bw.saturating_sub(FANOUT_BITS * (depth + 1) + 1);
@@ -28,32 +29,126 @@ fn child_index(value: u64, bw: usize, depth: usize) -> usize {
 #[derive(Default)]
 pub(crate) struct BucketNode {
     pub(crate) entries: Vec<usize>,
+    pub(crate) values: Vec<u64>,
+    pub(crate) fast_table: Vec<(u64, usize)>,
     pub(crate) children: Option<Box<[BucketNode; FANOUT]>>,
 }
 
 impl BucketNode {
     fn new() -> Self { Self::default() }
 
+    #[allow(dead_code)]
     #[inline]
-    pub(crate) fn find_leaf(&self, value: u64, bw: usize) -> &[usize] {
+    pub(crate) fn find_leaf(&self, value: u64, bw: usize) -> (&[usize], &[u64]) {
         let mut node = self;
-        let mut d = 0;
+        let mut shift = bw.saturating_sub(4);
         loop {
             match &node.children {
-                None => return &node.entries,
+                None => return (&node.entries, &node.values),
                 Some(kids) => {
-                    node = &kids[child_index(value, bw, d)];
-                    d += 1;
+                    node = &kids[(value >> shift) as usize & (FANOUT - 1)];
+                    shift = shift.saturating_sub(3);
                 }
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn fast_contains(&self, target: u64) -> bool {
+        if self.fast_table.is_empty() { return false; }
+        let mask = self.fast_table.len() - 1;
+        let hash = target.wrapping_mul(0x517cc1b727220a95);
+        let mut pos = ((hash ^ (hash >> 32)) as usize) & mask;
+        loop {
+            let (k, id) = unsafe { *self.fast_table.get_unchecked(pos) };
+            if id == usize::MAX {
+                return false;
+            }
+            if k == target {
+                return true;
+            }
+            pos = (pos + 1) & mask;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn fast_find(&self, target: u64) -> Option<usize> {
+        if self.fast_table.is_empty() { return None; }
+        let mask = self.fast_table.len() - 1;
+        let hash = target.wrapping_mul(0x517cc1b727220a95);
+        let mut pos = ((hash ^ (hash >> 32)) as usize) & mask;
+        loop {
+            let (k, id) = unsafe { *self.fast_table.get_unchecked(pos) };
+            if id == usize::MAX {
+                return None;
+            }
+            if k == target {
+                return Some(id);
+            }
+            pos = (pos + 1) & mask;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn fast_find_all(&self, target: u64) -> Vec<usize> {
+        if self.fast_table.is_empty() { return Vec::new(); }
+        let mask = self.fast_table.len() - 1;
+        let hash = target.wrapping_mul(0x517cc1b727220a95);
+        let mut pos = ((hash ^ (hash >> 32)) as usize) & mask;
+        let mut result = Vec::new();
+        loop {
+            let (k, id) = unsafe { *self.fast_table.get_unchecked(pos) };
+            if id == usize::MAX {
+                break;
+            }
+            if k == target {
+                result.push(id);
+            }
+            pos = (pos + 1) & mask;
+        }
+        result
+    }
+
+    fn sort_leaf(&mut self) {
+        if self.entries.len() > 1 {
+            let mut combined: Vec<_> = self.entries.iter().copied().zip(self.values.iter().copied()).collect();
+            combined.sort_unstable_by_key(|&(_, v)| v);
+            for (i, (id, val)) in combined.into_iter().enumerate() {
+                self.entries[i] = id;
+                self.values[i] = val;
             }
         }
     }
 
     /// Build tree from a flat list of storage IDs.
     fn build_from(ids: &[usize], bw: usize, data: &[u64]) -> Self {
-        let mut root = BucketNode { entries: ids.to_vec(), children: None };
+        let cap = if ids.is_empty() { 0 } else { (ids.len() * 2).next_power_of_two().max(8) };
+        let mut fast_table = vec![(u64::MAX, usize::MAX); cap];
+        if cap > 0 {
+            let mask = cap - 1;
+            for &id in ids {
+                let val = unsafe { *data.get_unchecked(id) };
+                let hash = val.wrapping_mul(0x517cc1b727220a95);
+                let mut pos = ((hash ^ (hash >> 32)) as usize) & mask;
+                unsafe {
+                    while fast_table.get_unchecked(pos).1 != usize::MAX {
+                        pos = (pos + 1) & mask;
+                    }
+                    *fast_table.get_unchecked_mut(pos) = (val, id);
+                }
+            }
+        }
+
+        let mut root = BucketNode {
+            entries: ids.to_vec(),
+            values: ids.iter().map(|&id| data[id]).collect(),
+            fast_table,
+            children: None,
+        };
         if root.entries.len() > LEAF_CAP {
             root.tree_split(bw, 0, data);
+        } else {
+            root.sort_leaf();
         }
         root
     }
@@ -63,16 +158,21 @@ impl BucketNode {
             return;
         }
         let mut kids: [BucketNode; FANOUT] = std::array::from_fn(|_| BucketNode::new());
-        let old = std::mem::take(&mut self.entries);
-        for storage_id in old {
-            let ci = child_index(data[storage_id], bw, depth);
+        let old_entries = std::mem::take(&mut self.entries);
+        let old_values = std::mem::take(&mut self.values);
+        let shift = bw.saturating_sub(FANOUT_BITS * (depth + 1) + 1);
+        for (storage_id, val) in old_entries.into_iter().zip(old_values.into_iter()) {
+            let ci = (val >> shift) as usize & (FANOUT - 1);
             kids[ci].entries.push(storage_id);
+            kids[ci].values.push(val);
         }
         self.children = Some(Box::new(kids));
         if let Some(kids) = &mut self.children {
             for kid in kids.iter_mut() {
                 if kid.entries.len() > LEAF_CAP {
                     kid.tree_split(bw, depth + 1, data);
+                } else if !kid.entries.is_empty() {
+                    kid.sort_leaf();
                 }
             }
         }
@@ -109,7 +209,9 @@ impl BucketNode {
     }
 
     pub(crate) fn tree_overhead_bytes(&self) -> usize {
-        let own = self.entries.capacity() * std::mem::size_of::<usize>();
+        let own = self.entries.capacity() * std::mem::size_of::<usize>()
+            + self.values.capacity() * std::mem::size_of::<u64>()
+            + self.fast_table.capacity() * std::mem::size_of::<(u64, usize)>();
         match &self.children {
             None => own,
             Some(kids) => {
@@ -163,7 +265,7 @@ pub struct Bwspi {
 
     // ── Lookup index (lazy tree, ≤64 per leaf) ───────────────────
     pub(crate) trees: Vec<BucketNode>,
-    tree_dirty: Vec<bool>,
+    pub(crate) tree_dirty: Vec<bool>,
 
     pub(crate) live_len: usize,
 }
@@ -215,10 +317,11 @@ impl Bwspi {
     /// Split into two steps to satisfy the borrow checker:
     /// step 1: ensure_tree_clean(&mut self)  — mutable
     /// step 2: route_clean(&self)            — immutable
+    #[allow(dead_code)]
     #[inline]
-    fn route_clean(&self, target: u64) -> &[usize] {
+    fn route_clean(&self, target: u64) -> (&[usize], &[u64]) {
         let w = bit_width(target);
-        if w >= self.trees.len() { return &[]; }
+        if w >= self.trees.len() { return (&[], &[]); }
         self.trees[w].find_leaf(target, w)
     }
 
@@ -266,43 +369,85 @@ impl Bwspi {
     pub fn insert(&mut self, value: u64) -> usize {
         let index = self.data.len();
         self.data.push(value);
-        self.bucket_positions.push(REMOVED_POSITION);
-        self.crud_link(index, bit_width(value));
+        let width = bit_width(value);
+        if width >= self.crud_buckets.len() {
+            self.crud_buckets.resize_with(width + 1, Vec::new);
+            self.trees.resize_with(width + 1, BucketNode::new);
+            self.tree_dirty.resize(width + 1, true);
+        }
+        let bucket = &mut self.crud_buckets[width];
+        self.bucket_positions.push(bucket.len());
+        bucket.push(index);
+        self.tree_dirty[width] = true;
         self.live_len += 1;
         index
     }
 
     pub fn insert_bulk(&mut self, values: &[u64]) {
-        self.data.reserve(values.len());
-        self.bucket_positions.reserve(values.len());
+        if values.is_empty() { return; }
+        let start_idx = self.data.len();
+        self.data.extend_from_slice(values);
+        let mut counts = [0usize; 65];
+        let mut max_width = 0;
         for &value in values {
-            let index = self.data.len();
-            self.data.push(value);
-            self.bucket_positions.push(REMOVED_POSITION);
-            self.crud_link(index, bit_width(value));
-            self.live_len += 1;
+            let w = bit_width(value);
+            unsafe {
+                *counts.get_unchecked_mut(w) += 1;
+            }
+            if w > max_width { max_width = w; }
         }
+        self.ensure_width(max_width);
+        let mut bucket_lens = [0usize; 65];
+        let mut bucket_ptrs = [std::ptr::null_mut::<usize>(); 65];
+        for w in 0..=max_width {
+            let count = counts[w];
+            if count > 0 {
+                let bucket = &mut self.crud_buckets[w];
+                let start_len = bucket.len();
+                bucket_lens[w] = start_len;
+                bucket.resize(start_len + count, 0);
+                bucket_ptrs[w] = unsafe { bucket.as_mut_ptr().add(start_len) };
+                self.tree_dirty[w] = true;
+            }
+        }
+        self.bucket_positions.resize(start_idx + values.len(), 0);
+        let pos_slice = &mut self.bucket_positions[start_idx..];
+        for (i, &value) in values.iter().enumerate() {
+            let w = bit_width(value);
+            unsafe {
+                let pos = *bucket_lens.get_unchecked(w);
+                *bucket_lens.get_unchecked_mut(w) = pos + 1;
+                *pos_slice.get_unchecked_mut(i) = pos;
+                let ptr = *bucket_ptrs.get_unchecked(w);
+                *ptr = start_idx + i;
+                *bucket_ptrs.get_unchecked_mut(w) = ptr.add(1);
+            }
+        }
+        self.live_len += values.len();
     }
 
     #[inline]
     pub fn contains(&mut self, target: u64) -> bool {
-        self.ensure_tree_clean(bit_width(target));
-        let leaf = self.route_clean(target);
-        leaf.iter().any(|&id| self.data[id] == target)
+        let w = bit_width(target);
+        self.ensure_tree_clean(w);
+        if w >= self.trees.len() { return false; }
+        self.trees[w].fast_contains(target)
     }
 
     #[inline]
     pub fn find(&mut self, target: u64) -> Option<usize> {
-        self.ensure_tree_clean(bit_width(target));
-        let leaf = self.route_clean(target);
-        leaf.iter().copied().find(|&id| self.data[id] == target)
+        let w = bit_width(target);
+        self.ensure_tree_clean(w);
+        if w >= self.trees.len() { return None; }
+        self.trees[w].fast_find(target)
     }
 
     #[must_use]
     pub fn find_all(&mut self, target: u64) -> Vec<usize> {
-        self.ensure_tree_clean(bit_width(target));
-        let leaf = self.route_clean(target);
-        leaf.iter().copied().filter(|&id| self.data[id] == target).collect()
+        let w = bit_width(target);
+        self.ensure_tree_clean(w);
+        if w >= self.trees.len() { return Vec::new(); }
+        self.trees[w].fast_find_all(target)
     }
 
     #[inline]
@@ -311,11 +456,9 @@ impl Bwspi {
     }
 
     pub fn remove(&mut self, target: u64) -> bool {
-        self.ensure_tree_clean(bit_width(target));
-        let index = {
-            let leaf = self.route_clean(target);
-            leaf.iter().copied().find(|&id| self.data[id] == target)
-        };
+        let w = bit_width(target);
+        self.ensure_tree_clean(w);
+        let index = if w >= self.trees.len() { None } else { self.trees[w].fast_find(target) };
         index.is_some_and(|i| self.remove_at(i))
     }
 
@@ -330,11 +473,9 @@ impl Bwspi {
     }
 
     pub fn update(&mut self, old: u64, new: u64) -> bool {
-        self.ensure_tree_clean(bit_width(old));
-        let index = {
-            let leaf = self.route_clean(old);
-            leaf.iter().copied().find(|&id| self.data[id] == old)
-        };
+        let w = bit_width(old);
+        self.ensure_tree_clean(w);
+        let index = if w >= self.trees.len() { None } else { self.trees[w].fast_find(old) };
         index.is_some_and(|i| self.update_at(i, new))
     }
 

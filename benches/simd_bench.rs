@@ -112,13 +112,13 @@ fn bench_lookup_hit(c: &mut Criterion) {
             group.throughput(Throughput::Elements(1));
 
             // ── BWSPI + SIMD ──
-            let bwspi = {
+            let mut bwspi = {
                 let mut b = Bwspi::with_capacity(size);
                 b.insert_bulk(&data);
                 b
             };
             group.bench_with_input(BenchmarkId::new("bwspi_simd", size), &target, |b, &t| {
-                b.iter(|| black_box(simd_contains(&bwspi, black_box(t))));
+                b.iter(|| black_box(simd_contains(&mut bwspi, black_box(t))));
             });
 
             // ── BWSPI scalar ──
@@ -178,7 +178,7 @@ fn bench_lookup_miss(c: &mut Criterion) {
 
             group.throughput(Throughput::Elements(1));
 
-            let bwspi = {
+            let mut bwspi = {
                 let mut b = Bwspi::with_capacity(size);
                 b.insert_bulk(&data);
                 b
@@ -186,7 +186,7 @@ fn bench_lookup_miss(c: &mut Criterion) {
 
             // ── BWSPI + SIMD ──
             group.bench_with_input(BenchmarkId::new("bwspi_simd", size), &target, |b, &t| {
-                b.iter(|| black_box(simd_contains(&bwspi, black_box(t))));
+                b.iter(|| black_box(simd_contains(&mut bwspi, black_box(t))));
             });
 
             // ── BWSPI scalar ──

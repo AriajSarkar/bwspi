@@ -244,7 +244,7 @@ fn bench_lookup_hit(c: &mut Criterion) {
             group.throughput(Throughput::Elements(1));
 
             // BWSPI
-            let bwspi = {
+            let mut bwspi = {
                 let mut b = Bwspi::with_capacity(size);
                 b.insert_bulk(&data);
                 b
@@ -309,7 +309,7 @@ fn bench_lookup_miss(c: &mut Criterion) {
             group.throughput(Throughput::Elements(1));
 
             // BWSPI
-            let bwspi = {
+            let mut bwspi = {
                 let mut b = Bwspi::with_capacity(size);
                 b.insert_bulk(&data);
                 b

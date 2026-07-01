@@ -1,8 +1,8 @@
-//! Standalone verification of the fast_table accelerator.
+//! Standalone verification of the LSB radix tree lookup.
 //!
 //! Run with:  cargo test --test verify_fast_table
 //!
-//! This test independently verifies that the fast_table-based contains/find/find_all
+//! This test independently verifies that the LSB radix tree-based contains/find/find_all
 //! produce IDENTICAL results to a brute-force linear scan of the data array.
 
 use bwspi::Bwspi;
@@ -165,7 +165,7 @@ fn verify_after_removes_and_updates() {
 #[test]
 fn verify_uniform_width_worst_case() {
     // ALL values in the same bit-width bucket — the worst case for BWSPI
-    // This forces a single massive fast_table
+    // This forces a single massive LSB radix tree
     let mut bwspi = Bwspi::new();
     let base = 1u64 << 31;
     for i in 0..10_000u64 {
@@ -184,7 +184,7 @@ fn verify_uniform_width_worst_case() {
 }
 
 #[test]
-fn verify_sorted_snapshot_still_correct_after_fast_table() {
+fn verify_sorted_snapshot_still_correct_after_lsb_tree() {
     let mut rng = XorShift64(0xfeed_face_1234_5678);
     let mut bwspi = Bwspi::new();
     for _ in 0..5000 {
@@ -202,7 +202,7 @@ fn verify_sorted_snapshot_still_correct_after_fast_table() {
 }
 
 #[test]
-fn verify_sarkar_sort_still_correct_after_fast_table() {
+fn verify_sarkar_sort_still_correct_after_lsb_tree() {
     let mut rng = XorShift64(0x0bad_cafe_dead_c0de);
     let mut bwspi = Bwspi::new();
     for _ in 0..5000 {

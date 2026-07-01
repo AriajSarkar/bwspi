@@ -1,39 +1,58 @@
 use bwspi::Bwspi;
 
 #[test]
-fn test_safety_clamp_extreme_load_factor() {
-    // EXPERIMENT 1: Ridiculously high load factor
-    // If the fast_table is 100% full (no empty sentinel slots), an open-addressing
-    // hash table search will infinite loop when looking for a missing element.
-    // The load_factor = 100.0 asks for exactly this. Our min_cap = N + 1 protects against it.
-    
-    let mut array = Bwspi::new().with_load_factor(100.0);
-    
-    // Insert 100 elements (must be > 64 to trigger fast_table)
-    // We use numbers in the same bit-width (e.g., 256 to 355) so they fall in the same bucket.
-    for i in 256..356 {
+fn test_lsb_radix_large_bucket_correctness() {
+    // Verify the LSB radix tree handles large buckets correctly.
+    // With no hash table and no empty slots, we must verify that
+    // the bit-extraction routing finds all values without collision.
+
+    let mut array = Bwspi::new();
+
+    // Insert 200 elements in the same bit-width bucket (9-bit: 256..455)
+    // This forces the LSB radix tree to split by trailing bits.
+    for i in 256..456 {
         array.insert(i);
     }
-    
-    // Verify it doesn't infinite loop on hits
-    for i in 256..356 {
-        assert!(array.contains(i));
+
+    // Verify all hits
+    for i in 256..456 {
+        assert!(array.contains(i), "missing {}", i);
     }
-    
-    // Verify it doesn't infinite loop on misses!
-    // (If min_cap failed and the table is 100% full, this line would hang your PC forever)
+
+    // Verify misses (values outside the range but same bit-width)
+    for i in 456..556 {
+        assert!(!array.contains(i), "false positive for {}", i);
+    }
+
+    // Verify misses in different bit-widths
+    assert!(!array.contains(0));
+    assert!(!array.contains(1));
     assert!(!array.contains(9999));
-    
-    // EXPERIMENT 2: Ridiculously small load factor
-    // If a user passes 0.0000001, it would try to allocate terabytes of RAM and crash (OOM).
-    // Our clamp limits it to 0.01 minimum.
-    
-    let mut array2 = Bwspi::new().with_load_factor(0.0000001);
-    
-    for i in 256..356 {
-        array2.insert(i);
+    assert!(!array.contains(u64::MAX));
+}
+
+#[test]
+fn test_lsb_radix_extreme_same_trailing_bits() {
+    // Worst case for LSB routing: many values with identical trailing bits.
+    // e.g. all values end in 0b0000 (multiples of 16).
+    // The radix tree must still correctly split and find them.
+
+    let mut array = Bwspi::new();
+
+    // Insert 200 multiples of 16 (all share trailing 4 bits = 0000)
+    for i in 0..200u64 {
+        array.insert((i + 16) * 16); // values 256, 272, 288, ...
     }
-    
-    // Verify it works and didn't crash your RAM
-    assert!(array2.contains(300));
+
+    // Verify all hits
+    for i in 0..200u64 {
+        let val = (i + 16) * 16;
+        assert!(array.contains(val), "missing {}", val);
+    }
+
+    // Verify misses (odd numbers can't be multiples of 16)
+    for i in 0..100u64 {
+        let val = (i + 16) * 16 + 1;
+        assert!(!array.contains(val), "false positive for {}", val);
+    }
 }

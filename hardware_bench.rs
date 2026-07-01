@@ -7,7 +7,7 @@
 //! Windows SDK APIs exposed by the OS and the Rust standard library; no driver,
 //! kernel extension, or unapproved telemetry package is installed.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::hint::black_box;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -42,6 +42,16 @@ struct ResultRow {
     cpu_percent: Option<f64>,
     working_set_delta: isize,
     traffic_lower_bound: usize,
+}
+
+#[derive(Clone)]
+struct ResourceRow {
+    workload: &'static str,
+    structure: &'static str,
+    stored_entries: usize,
+    bytes: usize,
+    bytes_per_input: f64,
+    note: &'static str,
 }
 
 #[derive(Clone, Copy)]
@@ -145,23 +155,13 @@ fn run_stream_workloads(rows: &mut Vec<ResultRow>, label: &'static str, data: &[
     let bytes = std::mem::size_of_val(data);
     let targets = sample_targets(data);
 
-    rows.push(benchmark(label, "BWSPI insert", bytes * 2, || {
+    rows.push(benchmark(label, "BWSPI array insert", bytes * 2, || {
         let mut index = Bwspi::with_capacity(data.len());
         index.insert_bulk(black_box(data));
         black_box(index.len());
     }));
-    rows.push(benchmark(label, "Vec push", bytes, || {
-        let mut values = Vec::with_capacity(data.len());
-        values.extend_from_slice(black_box(data));
-        black_box(values.len());
-    }));
     rows.push(benchmark(label, "HashSet insert", bytes * 2, || {
         let mut set = HashSet::with_capacity(data.len());
-        set.extend(black_box(data).iter().copied());
-        black_box(set.len());
-    }));
-    rows.push(benchmark(label, "BTreeSet insert", bytes * 2, || {
-        let mut set = BTreeSet::new();
         set.extend(black_box(data).iter().copied());
         black_box(set.len());
     }));
@@ -171,31 +171,12 @@ fn run_stream_workloads(rows: &mut Vec<ResultRow>, label: &'static str, data: &[
         value.insert_bulk(data);
         value
     };
-    let vector = data.to_vec();
-    let mut sorted = data.to_vec();
-    sorted.sort_unstable();
     let hash: HashSet<u64> = data.iter().copied().collect();
-    let tree: BTreeSet<u64> = data.iter().copied().collect();
     let lookup_bytes = targets.len() * std::mem::size_of::<u64>();
 
-    rows.push(benchmark(label, "BWSPI contains", lookup_bytes, || {
+    rows.push(benchmark(label, "BWSPI array contains", lookup_bytes, || {
         for &target in &targets {
             black_box(index.contains(black_box(target)));
-        }
-    }));
-    rows.push(benchmark(
-        label,
-        "Vec linear contains",
-        lookup_bytes,
-        || {
-            for &target in &targets {
-                black_box(vector.contains(black_box(&target)));
-            }
-        },
-    ));
-    rows.push(benchmark(label, "Vec binary_search", lookup_bytes, || {
-        for &target in &targets {
-            let _ = black_box(sorted.binary_search(black_box(&target)));
         }
     }));
     rows.push(benchmark(label, "HashSet contains", lookup_bytes, || {
@@ -203,114 +184,6 @@ fn run_stream_workloads(rows: &mut Vec<ResultRow>, label: &'static str, data: &[
             black_box(hash.contains(black_box(&target)));
         }
     }));
-    rows.push(benchmark(label, "BTreeSet contains", lookup_bytes, || {
-        for &target in &targets {
-            black_box(tree.contains(black_box(&target)));
-        }
-    }));
-}
-
-fn run_sort_workloads(rows: &mut Vec<ResultRow>, label: &'static str, data: &[u64]) {
-    let bytes = std::mem::size_of_val(data);
-    let mut snapshot_index = {
-        let mut index = Bwspi::with_capacity(data.len());
-        index.insert_bulk(data);
-        index
-    };
-    rows.push(benchmark(
-        label,
-        "BWSPI sorted_snapshot (prebuilt index)",
-        bytes * 2,
-        || {
-            black_box(snapshot_index.sorted_snapshot());
-        },
-    ));
-    rows.push(benchmark(
-        label,
-        "BWSPI build + snapshot",
-        bytes * 3,
-        || {
-            let mut index = Bwspi::with_capacity(data.len());
-            index.insert_bulk(data);
-            black_box(index.sorted_snapshot());
-        },
-    ));
-    rows.push(benchmark(
-        label,
-        "Sarkar Sort (build + sort)",
-        bytes * 3,
-        || {
-            let mut index = Bwspi::with_capacity(data.len());
-            index.insert_bulk(data);
-            black_box(index.sarkar_sort());
-            assert!(index.data()[..index.len()].is_sorted());
-        },
-    ));
-    rows.push(benchmark(label, "Vec sort_unstable", bytes * 2, || {
-        let mut values = data.to_vec();
-        values.sort_unstable();
-        black_box(values);
-    }));
-    rows.push(benchmark(label, "Vec stable sort", bytes * 2, || {
-        let mut values = data.to_vec();
-        values.sort();
-        black_box(values);
-    }));
-}
-
-fn run_update_delete_workloads(rows: &mut Vec<ResultRow>, data: &[u64]) {
-    let updates = (0..data.len()).step_by(97).collect::<Vec<_>>();
-    let bytes = updates.len() * std::mem::size_of::<u64>();
-    rows.push(benchmark(
-        "CRUD, high entropy",
-        "BWSPI update_at",
-        bytes * 2,
-        || {
-            let mut index = Bwspi::with_capacity(data.len());
-            index.insert_bulk(data);
-            for &id in &updates {
-                black_box(index.update_at(id, data[id] ^ (1_u64 << 63)));
-            }
-            black_box(index.len());
-        },
-    ));
-    rows.push(benchmark(
-        "CRUD, high entropy",
-        "Vec indexed update",
-        bytes,
-        || {
-            let mut values = data.to_vec();
-            for &id in &updates {
-                values[id] ^= 1_u64 << 63;
-            }
-            black_box(values);
-        },
-    ));
-    rows.push(benchmark(
-        "CRUD, high entropy",
-        "BWSPI remove_at",
-        bytes,
-        || {
-            let mut index = Bwspi::with_capacity(data.len());
-            index.insert_bulk(data);
-            for &id in &updates {
-                black_box(index.remove_at(id));
-            }
-            black_box(index.len());
-        },
-    ));
-    rows.push(benchmark(
-        "CRUD, high entropy",
-        "Vec tombstone write",
-        bytes,
-        || {
-            let mut values = data.to_vec();
-            for &id in &updates {
-                values[id] = 0;
-            }
-            black_box(values);
-        },
-    ));
 }
 
 fn fmt_duration(duration: Duration) -> String {
@@ -333,6 +206,41 @@ fn fmt_bytes(value: usize) -> String {
     } else {
         format!("{:.2} MiB", value as f64 / (1024.0 * 1024.0))
     }
+}
+
+fn hashset_memory_estimate(set: &HashSet<u64>) -> usize {
+    set.capacity() * (std::mem::size_of::<u64>() + 1)
+}
+
+fn collect_resource_rows(label: &'static str, data: &[u64]) -> Vec<ResourceRow> {
+    let mut index = Bwspi::with_capacity(data.len());
+    index.insert_bulk(data);
+    for target in sample_targets(data) {
+        black_box(index.contains(black_box(target)));
+    }
+
+    let hash: HashSet<u64> = data.iter().copied().collect();
+    let bwspi_bytes = index.memory_usage_bytes();
+    let hash_bytes = hashset_memory_estimate(&hash);
+
+    vec![
+        ResourceRow {
+            workload: label,
+            structure: "BWSPI array",
+            stored_entries: index.len(),
+            bytes: bwspi_bytes,
+            bytes_per_input: bwspi_bytes as f64 / data.len() as f64,
+            note: "self-reported live data + CRUD buckets + lookup tree",
+        },
+        ResourceRow {
+            workload: label,
+            structure: "HashSet",
+            stored_entries: hash.len(),
+            bytes: hash_bytes,
+            bytes_per_input: hash_bytes as f64 / data.len() as f64,
+            note: "capacity lower bound: control byte + u64 per slot",
+        },
+    ]
 }
 
 fn shell(command: &str) -> String {
@@ -369,13 +277,14 @@ fn acpi_temperature_celsius() -> String {
 
 fn report(
     rows: &[ResultRow],
+    resources: &[ResourceRow],
     element_count: usize,
     suite_started_temp: &str,
     suite_ended_temp: &str,
 ) -> String {
     let mut output = String::new();
-    output.push_str("# Native BWSPI Benchmark\n\n");
-    output.push_str("Generated by `cargo run --release --bin hardware_bench`. Each timing is the median of seven warm runs; it is a local measurement, not a cross-machine claim.\n\n");
+    output.push_str("# BWSPI Array vs HashSet Benchmark\n\n");
+    output.push_str("Generated by `cargo run --release --bin hardware_bench`. This report intentionally compares only BWSPI array lookup/indexing against `std::collections::HashSet`. Each timing is the median of seven warm runs; it is a local measurement, not a cross-machine claim.\n\n");
     output.push_str("## Environment\n\n");
     output.push_str(&format!("- {}\n", system_inventory()));
     output.push_str(&format!("- Rust: {}\n", shell("rustc --version")));
@@ -399,7 +308,7 @@ fn report(
     output.push_str("- CPU package temperature is **not** available through a universal Windows API. Dell Command Monitor, LibreHardwareMonitor, or vendor drivers can expose it when already installed; this bench intentionally does not install drivers or infer a package temperature from ACPI.\n");
     output.push_str("- Per-core L1/L2 occupancy and hardware register pressure are **not** exposed as reliable Windows user-mode counters on this CPU. Cache sizes below are hardware topology; `traffic lower bound` is application-level bytes touched, not DRAM-controller bandwidth.\n");
 
-    output.push_str("\n## Results\n\n");
+    output.push_str("\n## Speed\n\n");
     output.push_str("| Workload | Algorithm | Median | Min–max | Process CPU | Working-set delta | Traffic lower bound |\n");
     output.push_str("|---|---:|---:|---:|---:|---:|---:|\n");
     for row in rows {
@@ -419,8 +328,23 @@ fn report(
         ));
     }
 
+    output.push_str("\n## Resources\n\n");
+    output.push_str("| Workload | Structure | Stored entries | Memory | Bytes / input | Note |\n");
+    output.push_str("|---|---:|---:|---:|---:|---|\n");
+    for row in resources {
+        output.push_str(&format!(
+            "| {} | {} | {} | {} | {:.1} B | {} |\n",
+            row.workload,
+            row.structure,
+            row.stored_entries,
+            fmt_bytes(row.bytes),
+            row.bytes_per_input,
+            row.note,
+        ));
+    }
+
     output.push_str("\n## Interpretation boundaries\n\n");
-    output.push_str("`HashSet`/`BTreeSet` deduplicate values, whereas BWSPI and `Vec` retain duplicates. They are included for contains/insert reference, not as semantic replacements. `Vec::binary_search` includes the one-time pre-sort only in the sort rows, not in lookup timing. Rust's `sort_unstable` and stable `sort` are the standard-library sorting baselines.\n");
+    output.push_str("BWSPI retains duplicates and supports storage IDs, ordered snapshots, updates, and removes. `HashSet` deduplicates values and is only a membership set. The `HashSet` memory number is a capacity lower bound because the standard library does not expose exact heap bytes.\n");
     output
 }
 
@@ -437,13 +361,14 @@ fn main() {
 
     run_stream_workloads(&mut rows, "stream, high entropy", &entropy);
     run_stream_workloads(&mut rows, "stream, uniform 32-bit", &uniform);
-    run_sort_workloads(&mut rows, "sort, high entropy", &entropy);
-    run_sort_workloads(&mut rows, "sort, uniform 32-bit", &uniform);
-    run_update_delete_workloads(&mut rows, &entropy);
+    let mut resources = Vec::new();
+    resources.extend(collect_resource_rows("stream, high entropy", &entropy));
+    resources.extend(collect_resource_rows("stream, uniform 32-bit", &uniform));
 
     let after_temperature = acpi_temperature_celsius();
     let markdown = report(
         &rows,
+        &resources,
         element_count,
         &before_temperature,
         &after_temperature,

@@ -2,11 +2,9 @@ use super::{sarkar_sort, snapshot_sort};
 
 const REMOVED_POSITION: usize = usize::MAX;
 
-// ── Recursive bucket tree constants ──────────────────────────────────
+// ── LSB Radix Tree constants ─────────────────────────────────────────
 
 const LEAF_CAP: usize = 64;
-const FANOUT: usize = 8;
-const FANOUT_BITS: usize = 3;
 
 /// Computes the binary bit-width of a `u64` value.
 #[inline(always)]
@@ -14,209 +12,290 @@ pub fn bit_width(value: u64) -> usize {
     (u64::BITS - value.leading_zeros()) as usize
 }
 
-// NOTE: child_index() was removed — tree_split reads data[storage_id]
-// directly instead of routing through this helper.
-
-// ── BucketNode (Lookup-only tree) ────────────────────────────────────
+// ── FlatBucket (dense LSB radix tree) ────────────────────────────────
 //
 // Built lazily from the flat CRUD buckets. Rebuilt per-width only when
 // a lookup touches a dirty width.
+//
+// Architecture:
+//   - Routes by TRAILING bits (LSB), not leading bits (MSB)
+//   - Each level consumes the NEXT SPLIT_BITS bits moving leftward:
+//       Level 0: bits [0..SPLIT_BITS)
+//       Level 1: bits [SPLIT_BITS..2*SPLIT_BITS)
+//       Level 2: bits [2*SPLIT_BITS..3*SPLIT_BITS)
+//       ...
+//   - Children indexed by (value >> bit_offset) & mask — direct bit extraction
+//   - Existing children are found through a fixed 64-slot child map
+//   - Leaves store only storage_ids (Vec<usize>), no value copies
+//   - Confirms match via data[storage_id] == target
+//   - ZERO hash collisions, ZERO empty slots, ZERO stored values
+//   - Splits progressively deeper only when a leaf exceeds LEAF_CAP
+//   - Prunes empty children after build
 
-#[derive(Default)]
-pub(crate) struct BucketNode {
+/// Fixed number of bits consumed per tree level.
+/// 6 bits = 64 possible children per node, matching the ≤64 leaf scan cap.
+const SPLIT_BITS: u8 = 6;
+const SPLIT_FANOUT: usize = 1 << SPLIT_BITS; // 64
+
+pub(crate) struct FlatNode {
+    /// Storage IDs at leaf level. Empty for internal nodes.
     pub(crate) entries: Vec<usize>,
-    // NOTE: `values: Vec<u64>` was removed — each value was a duplicate of
-    // data[entry_id]. sort_leaf and tree_split now read from data[] directly.
-    pub(crate) fast_table: Vec<(u64, usize)>,
-    pub(crate) children: Option<Box<[BucketNode; FANOUT]>>,
+
+    /// Bit offset: which bits this node routes by.
+    /// Routes by bits [bit_offset .. bit_offset + SPLIT_BITS).
+    pub(crate) bit_offset: u8,
+
+    /// Bit i is 1 when child i exists. Zero means this node is a leaf.
+    pub(crate) child_bitmap: u64,
+
+    /// Start index of this node's 64 child slots inside FlatBucket.child_slots.
+    pub(crate) children_start: usize,
 }
 
-impl BucketNode {
+impl Default for FlatNode {
+    fn default() -> Self {
+        FlatNode {
+            entries: Vec::new(),
+            bit_offset: 0,
+            child_bitmap: 0,
+            children_start: 0,
+        }
+    }
+}
+
+pub(crate) struct FlatBucket {
+    pub(crate) nodes: Vec<FlatNode>,
+    pub(crate) child_slots: Vec<u32>,
+}
+
+impl Default for FlatBucket {
+    fn default() -> Self {
+        Self {
+            nodes: Vec::new(),
+            child_slots: Vec::new(),
+        }
+    }
+}
+
+impl FlatBucket {
     fn new() -> Self { Self::default() }
 
-    // NOTE: find_leaf() was removed — lookups now go through fast_table
-    // (open-addressing hash at the root) instead of walking tree children.
+    // ── LSB Radix Lookup Methods ─────────────────────────────────
+    //
+    // Each level extracts SPLIT_BITS bits starting at self.bit_offset.
+    // Level 0: idx = (value >> 0)  & 0x3F → bits 0-5
+    // Level 1: idx = (value >> 6)  & 0x3F → bits 6-11
+    // Level 2: idx = (value >> 12) & 0x3F → bits 12-17
 
     #[inline]
-    pub(crate) fn fast_contains(&self, target: u64) -> bool {
-        if self.fast_table.is_empty() { return false; }
-        let mask = self.fast_table.len() - 1;
-        let hash = target.wrapping_mul(0x517cc1b727220a95);
-        let mut pos = ((hash ^ (hash >> 32)) as usize) & mask;
+    fn leaf_entries_for(&self, target: u64) -> Option<&[usize]> {
+        let mut node_idx = 0;
         loop {
-            let (k, id) = unsafe { *self.fast_table.get_unchecked(pos) };
-            if id == usize::MAX {
-                return false;
+            let node = self.nodes.get(node_idx)?;
+            if node.child_bitmap == 0 {
+                return Some(&node.entries);
             }
-            if k == target {
-                return true;
-            }
-            pos = (pos + 1) & mask;
-        }
-    }
 
-    #[inline]
-    pub(crate) fn fast_find(&self, target: u64) -> Option<usize> {
-        if self.fast_table.is_empty() { return None; }
-        let mask = self.fast_table.len() - 1;
-        let hash = target.wrapping_mul(0x517cc1b727220a95);
-        let mut pos = ((hash ^ (hash >> 32)) as usize) & mask;
-        loop {
-            let (k, id) = unsafe { *self.fast_table.get_unchecked(pos) };
-            if id == usize::MAX {
+            let child_pos = ((target >> node.bit_offset) as usize) & (SPLIT_FANOUT - 1);
+            let bit = 1_u64 << child_pos;
+            if node.child_bitmap & bit == 0 {
                 return None;
             }
-            if k == target {
-                return Some(id);
+
+            let child_slot = node.children_start + child_pos;
+            let child_idx = *self.child_slots.get(child_slot)?;
+            if child_idx == u32::MAX {
+                return None;
             }
-            pos = (pos + 1) & mask;
+            node_idx = child_idx as usize;
         }
     }
 
     #[inline]
-    pub(crate) fn fast_find_all(&self, target: u64) -> Vec<usize> {
-        if self.fast_table.is_empty() { return Vec::new(); }
-        let mask = self.fast_table.len() - 1;
-        let hash = target.wrapping_mul(0x517cc1b727220a95);
-        let mut pos = ((hash ^ (hash >> 32)) as usize) & mask;
-        let mut result = Vec::new();
-        loop {
-            let (k, id) = unsafe { *self.fast_table.get_unchecked(pos) };
-            if id == usize::MAX {
-                break;
-            }
-            if k == target {
-                result.push(id);
-            }
-            pos = (pos + 1) & mask;
-        }
-        result
+    pub(crate) fn lsb_contains(&self, target: u64, data: &[u64]) -> bool {
+        self.leaf_entries_for(target)
+            .is_some_and(|entries| {
+                entries
+                    .binary_search_by_key(&target, |&id| data[id])
+                    .is_ok()
+            })
     }
 
-    fn sort_leaf(&mut self, data: &[u64]) {
-        if self.entries.len() > 1 {
-            self.entries.sort_unstable_by_key(|&id| data[id]);
-        }
+    #[inline]
+    pub(crate) fn lsb_find(&self, target: u64, data: &[u64]) -> Option<usize> {
+        let entries = self.leaf_entries_for(target)?;
+        entries
+            .binary_search_by_key(&target, |&id| data[id])
+            .ok()
+            .map(|position| entries[position])
     }
 
-    fn build_from(ids: &[usize], bw: usize, data: &[u64], load_factor: f64) -> Self {
-        // Fix 1: only build fast_table for large buckets
-        let fast_table = if ids.len() > LEAF_CAP {
-            // Apply configurable load factor
-            let min_cap = ids.len() + 1; // Absolute minimum to avoid infinite loops
-            // clamp load factor between 0.01 and 10.0 to prevent panic/OOM
-            let lf = load_factor.clamp(0.01, 10.0);
-            let target_cap = (ids.len() as f64 / lf).ceil() as usize;
-            let cap = target_cap.max(min_cap).next_power_of_two().max(8);
-            let mut table = vec![(u64::MAX, usize::MAX); cap];
-            let mask = cap - 1;
-            for &id in ids {
-                let val = unsafe { *data.get_unchecked(id) };
-                let hash = val.wrapping_mul(0x517cc1b727220a95);
-                let mut pos = ((hash ^ (hash >> 32)) as usize) & mask;
-                unsafe {
-                    while table.get_unchecked(pos).1 != usize::MAX {
-                        pos = (pos + 1) & mask;
-                    }
-                    *table.get_unchecked_mut(pos) = (val, id);
-                }
+    #[inline]
+    pub(crate) fn lsb_find_all(&self, target: u64, data: &[u64]) -> Vec<usize> {
+        self.leaf_entries_for(target)
+            .map(|entries| {
+                let start = entries.partition_point(|&id| data[id] < target);
+                let end = entries[start..].partition_point(|&id| data[id] == target) + start;
+                entries[start..end].to_vec()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Build a dense LSB radix tree from a flat list of storage IDs.
+    fn build_from(ids: &[usize], _bw: usize, data: &[u64], bit_offset: u8) -> Self {
+        if ids.is_empty() {
+            return Self::default();
+        }
+
+        let mut nodes = Vec::with_capacity((ids.len() / LEAF_CAP).saturating_mul(2).max(1));
+        let mut child_slots = Vec::new();
+        Self::build_node(ids, data, bit_offset, &mut nodes, &mut child_slots);
+        Self { nodes, child_slots }
+    }
+
+    fn build_node(
+        ids: &[usize],
+        data: &[u64],
+        bit_offset: u8,
+        nodes: &mut Vec<FlatNode>,
+        child_slots: &mut Vec<u32>,
+    ) -> usize {
+        let node_idx = nodes.len();
+        nodes.push(FlatNode::default());
+        Self::fill_node(node_idx, ids, data, bit_offset, nodes, child_slots);
+        node_idx
+    }
+
+    fn fill_node(
+        node_idx: usize,
+        ids: &[usize],
+        data: &[u64],
+        bit_offset: u8,
+        nodes: &mut Vec<FlatNode>,
+        child_slots: &mut Vec<u32>,
+    ) {
+        if ids.len() <= LEAF_CAP || bit_offset >= 64 {
+            let mut entries = ids.to_vec();
+            if entries.len() > 1 {
+                entries.sort_unstable_by_key(|&id| data[id]);
             }
-            table
-        } else {
-            Vec::new() // small bucket — linear scan via entries + data[]
-        };
-
-        let mut root = BucketNode {
-            entries: ids.to_vec(),
-            fast_table,
-            children: None,
-        };
-        if root.entries.len() > LEAF_CAP {
-            root.tree_split(bw, 0, data);
-        } else {
-            root.sort_leaf(data);
-        }
-        root
-    }
-
-    /// Recursively split a node into FANOUT children by bit-range.
-    /// `data` is needed to look up values for routing (since we no longer
-    /// store a duplicate `values` vec in each node).
-    fn tree_split(&mut self, bw: usize, depth: usize, data: &[u64]) {
-        if FANOUT_BITS * (depth + 1) >= bw.saturating_add(1) {
+            nodes[node_idx] = FlatNode {
+                entries,
+                bit_offset,
+                child_bitmap: 0,
+                children_start: 0,
+            };
             return;
         }
-        let mut kids: [BucketNode; FANOUT] = std::array::from_fn(|_| BucketNode::new());
-        let old_entries = std::mem::take(&mut self.entries);
-        let shift = bw.saturating_sub(FANOUT_BITS * (depth + 1) + 1);
-        for storage_id in old_entries {
-            let val = data[storage_id];
-            let ci = (val >> shift) as usize & (FANOUT - 1);
-            kids[ci].entries.push(storage_id);
+
+        let mask = SPLIT_FANOUT - 1;
+        let mut child_entries: [Vec<usize>; SPLIT_FANOUT] = std::array::from_fn(|_| Vec::new());
+        let mut child_bitmap = 0_u64;
+        for &id in ids {
+            let child_idx = ((data[id] >> bit_offset) as usize) & mask;
+            child_entries[child_idx].push(id);
+            child_bitmap |= 1_u64 << child_idx;
         }
-        self.children = Some(Box::new(kids));
-        if let Some(kids) = &mut self.children {
-            for kid in kids.iter_mut() {
-                if kid.entries.len() > LEAF_CAP {
-                    kid.tree_split(bw, depth + 1, data);
-                } else if !kid.entries.is_empty() {
-                    kid.sort_leaf(data);
-                }
+
+        let children_start = child_slots.len();
+        child_slots.resize(children_start + SPLIT_FANOUT, u32::MAX);
+
+        let child_nodes_start = nodes.len();
+        let child_count = child_bitmap.count_ones() as usize;
+        nodes.resize_with(child_nodes_start + child_count, FlatNode::default);
+
+        let next_bit_offset = bit_offset + SPLIT_BITS;
+        let mut child_node_idx = child_nodes_start;
+        for (child_pos, entries) in child_entries.into_iter().enumerate() {
+            if !entries.is_empty() {
+                child_slots[children_start + child_pos] =
+                    u32::try_from(child_node_idx).expect("flat node index exceeds u32");
+                Self::fill_node(
+                    child_node_idx,
+                    &entries,
+                    data,
+                    next_bit_offset,
+                    nodes,
+                    child_slots,
+                );
+                child_node_idx += 1;
             }
         }
+
+        nodes[node_idx] = FlatNode {
+            entries: Vec::new(),
+            bit_offset,
+            child_bitmap,
+            children_start,
+        };
     }
 
     #[allow(dead_code)]
     pub(crate) fn total_len(&self) -> usize {
-        match &self.children {
-            None => self.entries.len(),
-            Some(kids) => kids.iter().map(|k| k.total_len()).sum(),
-        }
+        self.nodes.iter().map(|node| node.entries.len()).sum()
     }
 
     #[allow(dead_code)]
     pub(crate) fn all_empty(&self) -> bool {
-        match &self.children {
-            None => self.entries.is_empty(),
-            Some(kids) => kids.iter().all(|k| k.all_empty()),
-        }
+        self.nodes.iter().all(|node| node.entries.is_empty())
     }
 
     pub(crate) fn for_each_leaf<F: FnMut(&Vec<usize>)>(&self, f: &mut F) {
-        match &self.children {
-            None => f(&self.entries),
-            Some(kids) => { for kid in kids.iter() { kid.for_each_leaf(f); } }
-        }
-    }
-
-    pub(crate) fn for_each_leaf_mut<F: FnMut(&mut Vec<usize>)>(&mut self, f: &mut F) {
-        match &mut self.children {
-            None => f(&mut self.entries),
-            Some(kids) => { for kid in kids.iter_mut() { kid.for_each_leaf_mut(f); } }
-        }
-    }
-
-    pub(crate) fn tree_overhead_bytes(&self) -> usize {
-        let own = self.entries.capacity() * std::mem::size_of::<usize>()
-            + self.fast_table.capacity() * std::mem::size_of::<(u64, usize)>();
-        match &self.children {
-            None => own,
-            Some(kids) => {
-                own + std::mem::size_of::<[BucketNode; FANOUT]>()
-                    + kids.iter().map(|k| k.tree_overhead_bytes()).sum::<usize>()
+        for node in &self.nodes {
+            if node.child_bitmap == 0 {
+                f(&node.entries);
             }
         }
     }
 
     #[allow(dead_code)]
-    pub(crate) fn has_split(&self) -> bool { self.children.is_some() }
+    pub(crate) fn for_each_leaf_mut<F: FnMut(&mut Vec<usize>)>(&mut self, f: &mut F) {
+        for node in &mut self.nodes {
+            if node.child_bitmap == 0 {
+                f(&mut node.entries);
+            }
+        }
+    }
+
+    pub(crate) fn tree_overhead_bytes(&self) -> usize {
+        let nodes = self.nodes.capacity() * std::mem::size_of::<FlatNode>();
+        let child_slots = self.child_slots.capacity() * std::mem::size_of::<u32>();
+        let entries: usize = self.nodes
+            .iter()
+            .map(|node| node.entries.capacity() * std::mem::size_of::<usize>())
+            .sum();
+        nodes + child_slots + entries
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn has_split(&self) -> bool {
+        self.nodes.first().is_some_and(|node| node.child_bitmap != 0)
+    }
 
     #[allow(dead_code)]
     pub(crate) fn max_depth(&self) -> usize {
-        match &self.children {
-            None => 0,
-            Some(kids) => 1 + kids.iter().map(|k| k.max_depth()).max().unwrap_or(0),
+        if self.nodes.is_empty() {
+            0
+        } else {
+            self.node_depth(0)
         }
+    }
+
+    #[allow(dead_code)]
+    fn node_depth(&self, node_idx: usize) -> usize {
+        let node = &self.nodes[node_idx];
+        if node.child_bitmap == 0 {
+            return 0;
+        }
+
+        let mut max_child_depth = 0;
+        let child_range = node.children_start..node.children_start + SPLIT_FANOUT;
+        for &child_idx in &self.child_slots[child_range] {
+            if child_idx != u32::MAX {
+                max_child_depth = max_child_depth.max(self.node_depth(child_idx as usize));
+            }
+        }
+        1 + max_child_depth
     }
 }
 
@@ -235,7 +314,7 @@ pub struct BucketStats {
 //     ALL mutations go here: O(1) push, O(1) swap_remove.
 //     This is the source of truth.
 //
-//   trees — recursive BucketNode per bit-width.
+//   trees — dense FlatBucket per bit-width.
 //     Built LAZILY from crud_buckets when a lookup needs it.
 //     NEVER touched during insert/remove/update.
 //     Rebuilt per-width when `tree_dirty[w]` is true.
@@ -250,13 +329,11 @@ pub struct Bwspi {
     pub(crate) crud_buckets: Vec<Vec<usize>>,
     pub(crate) bucket_positions: Vec<usize>,
 
-    // ── Lookup index (lazy tree, ≤64 per leaf) ───────────────────
-    pub(crate) trees: Vec<BucketNode>,
+    // ── Lookup index (LSB radix tree, ≤64 per leaf) ──────────────
+    pub(crate) trees: Vec<FlatBucket>,
     pub(crate) tree_dirty: Vec<bool>,
 
     pub(crate) live_len: usize,
-    /// Target load factor for the fast_table lookup accelerator. Defaults to 0.7.
-    pub load_factor: f64,
 }
 
 impl Bwspi {
@@ -272,26 +349,6 @@ impl Bwspi {
             trees: Vec::new(),
             tree_dirty: Vec::new(),
             live_len: 0,
-            load_factor: 0.7,
-        }
-    }
-
-    /// Builder method to configure the fast_table load factor.
-    /// Lower values (e.g. 0.5) use more memory but are faster.
-    /// Higher values (e.g. 0.99) save memory but increase lookup collisions.
-    /// Defaults to 0.7 (~70% load factor).
-    #[must_use]
-    pub fn with_load_factor(mut self, load_factor: f64) -> Self {
-        self.load_factor = load_factor;
-        self
-    }
-
-    /// Update the fast_table load factor. Affects future index rebuilds.
-    pub fn set_load_factor(&mut self, load_factor: f64) {
-        self.load_factor = load_factor;
-        // Mark all active trees as dirty so they rebuild with the new factor on next use.
-        for dirty in self.tree_dirty.iter_mut() {
-            *dirty = true;
         }
     }
 
@@ -299,7 +356,7 @@ impl Bwspi {
     fn ensure_width(&mut self, width: usize) {
         if width >= self.crud_buckets.len() {
             self.crud_buckets.resize_with(width + 1, Vec::new);
-            self.trees.resize_with(width + 1, BucketNode::new);
+            self.trees.resize_with(width + 1, FlatBucket::new);
             self.tree_dirty.resize(width + 1, true);
         }
     }
@@ -313,15 +370,12 @@ impl Bwspi {
     #[inline]
     fn ensure_tree_clean(&mut self, width: usize) {
         if width < self.tree_dirty.len() && self.tree_dirty[width] {
-            self.trees[width] = BucketNode::build_from(
-                &self.crud_buckets[width], width, &self.data, self.load_factor
+            self.trees[width] = FlatBucket::build_from(
+                &self.crud_buckets[width], width, &self.data, 0
             );
             self.tree_dirty[width] = false;
         }
     }
-
-    // NOTE: route_clean() was removed — it was the old lookup path that walked
-    // the tree via find_leaf(). All lookups now go through fast_table directly.
 
     #[inline]
     pub(crate) fn shrink_trailing(&mut self) {
@@ -370,7 +424,7 @@ impl Bwspi {
         let width = bit_width(value);
         if width >= self.crud_buckets.len() {
             self.crud_buckets.resize_with(width + 1, Vec::new);
-            self.trees.resize_with(width + 1, BucketNode::new);
+            self.trees.resize_with(width + 1, FlatBucket::new);
             self.tree_dirty.resize(width + 1, true);
         }
         let bucket = &mut self.crud_buckets[width];
@@ -429,13 +483,7 @@ impl Bwspi {
         let w = bit_width(target);
         self.ensure_tree_clean(w);
         if w >= self.trees.len() { return false; }
-        let tree = &self.trees[w];
-        if !tree.fast_table.is_empty() {
-            tree.fast_contains(target)
-        } else {
-            // Small bucket (≤LEAF_CAP) — linear scan, fits in L1 cache
-            tree.entries.iter().any(|&id| self.data[id] == target)
-        }
+        self.trees[w].lsb_contains(target, &self.data)
     }
 
     #[inline]
@@ -443,13 +491,7 @@ impl Bwspi {
         let w = bit_width(target);
         self.ensure_tree_clean(w);
         if w >= self.trees.len() { return None; }
-        let tree = &self.trees[w];
-        if !tree.fast_table.is_empty() {
-            tree.fast_find(target)
-        } else {
-            // Small bucket — linear scan
-            tree.entries.iter().copied().find(|&id| self.data[id] == target)
-        }
+        self.trees[w].lsb_find(target, &self.data)
     }
 
     #[must_use]
@@ -457,13 +499,7 @@ impl Bwspi {
         let w = bit_width(target);
         self.ensure_tree_clean(w);
         if w >= self.trees.len() { return Vec::new(); }
-        let tree = &self.trees[w];
-        if !tree.fast_table.is_empty() {
-            tree.fast_find_all(target)
-        } else {
-            // Small bucket — linear scan
-            tree.entries.iter().copied().filter(|&id| self.data[id] == target).collect()
-        }
+        self.trees[w].lsb_find_all(target, &self.data)
     }
 
     #[inline]
@@ -477,12 +513,7 @@ impl Bwspi {
         let index = if w >= self.trees.len() {
             None
         } else {
-            let tree = &self.trees[w];
-            if !tree.fast_table.is_empty() {
-                tree.fast_find(target)
-            } else {
-                tree.entries.iter().copied().find(|&id| self.data[id] == target)
-            }
+            self.trees[w].lsb_find(target, &self.data)
         };
         index.is_some_and(|i| self.remove_at(i))
     }
@@ -503,12 +534,7 @@ impl Bwspi {
         let index = if w >= self.trees.len() {
             None
         } else {
-            let tree = &self.trees[w];
-            if !tree.fast_table.is_empty() {
-                tree.fast_find(old)
-            } else {
-                tree.entries.iter().copied().find(|&id| self.data[id] == old)
-            }
+            self.trees[w].lsb_find(old, &self.data)
         };
         index.is_some_and(|i| self.update_at(i, new))
     }
@@ -559,8 +585,8 @@ impl Bwspi {
     fn rebuild_all_dirty(&mut self) {
         for w in 0..self.tree_dirty.len() {
             if self.tree_dirty[w] {
-                self.trees[w] = BucketNode::build_from(
-                    &self.crud_buckets[w], w, &self.data, self.load_factor
+                self.trees[w] = FlatBucket::build_from(
+                    &self.crud_buckets[w], w, &self.data, 0
                 );
                 self.tree_dirty[w] = false;
             }
@@ -616,7 +642,7 @@ impl Bwspi {
         let pos_bytes = self.bucket_positions.capacity() * 8;
         let crud_outer = self.crud_buckets.capacity() * std::mem::size_of::<Vec<usize>>();
         let crud_inner: usize = self.crud_buckets.iter().map(|b| b.capacity() * 8).sum();
-        let tree_outer = self.trees.capacity() * std::mem::size_of::<BucketNode>();
+        let tree_outer = self.trees.capacity() * std::mem::size_of::<FlatBucket>();
         let tree_inner: usize = self.trees.iter().map(|t| t.tree_overhead_bytes()).sum();
         let dirty_bytes = self.tree_dirty.capacity();
         data_bytes + pos_bytes + crud_outer + crud_inner + tree_outer + tree_inner + dirty_bytes

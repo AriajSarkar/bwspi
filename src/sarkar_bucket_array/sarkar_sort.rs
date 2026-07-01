@@ -7,34 +7,33 @@ pub struct SarkarSortStats {
     pub swaps: usize,
 }
 
-/// Sort using tree leaves for ordering, cycle permutation for data
+/// Sort using globally-sorted storage IDs, cycle permutation for data
 /// movement, then rebuild both indexes from the sorted result.
 pub(crate) fn sort_in_place(index: &mut Bwspi) -> SarkarSortStats {
     let mut stats = SarkarSortStats::default();
 
-    // Phase A: sort each tree leaf's entries by data value.
-    for width in 0..index.trees.len() {
-        index.trees[width].for_each_leaf_mut(&mut |leaf| {
-            if leaf.len() > 1 {
-                stats.buckets_sorted += 1;
-                leaf.sort_unstable_by_key(|&id| index.data[id]);
-            } else if !leaf.is_empty() {
-                stats.buckets_sorted += 1;
-            }
-        });
-    }
-
-    // Phase B: walk all tree leaves in order to assign destinations.
-    let mut destination = 0usize;
+    // Phase A: collect ALL live storage IDs from all tree leaves,
+    // then sort globally by data[id].
+    //
+    // With LSB radix trees, leaf traversal order does NOT equal value order
+    // (children are ordered by trailing bits, not by value). So we collect
+    // all IDs and sort them globally.
+    let mut all_ids: Vec<usize> = Vec::with_capacity(index.live_len);
     for width in 0..index.trees.len() {
         index.trees[width].for_each_leaf(&mut |leaf| {
-            for &storage_id in leaf.iter() {
-                index.bucket_positions[storage_id] = destination;
-                destination += 1;
+            if !leaf.is_empty() {
+                stats.buckets_sorted += 1;
             }
+            all_ids.extend_from_slice(leaf);
         });
     }
-    debug_assert_eq!(destination, index.live_len);
+    all_ids.sort_unstable_by_key(|&id| index.data[id]);
+
+    // Phase B: assign destinations in sorted order.
+    for (destination, &storage_id) in all_ids.iter().enumerate() {
+        index.bucket_positions[storage_id] = destination;
+    }
+    let mut destination = index.live_len;
 
     // Dead storage after the live prefix.
     for source in 0..index.data.len() {
@@ -54,19 +53,7 @@ pub(crate) fn sort_in_place(index: &mut Bwspi) -> SarkarSortStats {
         }
     }
 
-    // Phase D: rebind BOTH indexes from the sorted data.
-    // Tree: rebind leaf entries to sequential data positions.
-    let mut start = 0usize;
-    for width in 0..index.trees.len() {
-        index.trees[width].for_each_leaf_mut(&mut |leaf| {
-            for (offset, storage_id) in leaf.iter_mut().enumerate() {
-                *storage_id = start + offset;
-            }
-            start += leaf.len();
-        });
-    }
-    debug_assert_eq!(start, index.live_len);
-
+    // Phase D: rebuild BOTH indexes from the sorted data.
     // Flat CRUD index: rebuild from scratch — each width gets sequential IDs.
     for bucket in index.crud_buckets.iter_mut() {
         bucket.clear();
@@ -83,6 +70,7 @@ pub(crate) fn sort_in_place(index: &mut Bwspi) -> SarkarSortStats {
         index.bucket_positions[position] = usize::MAX;
     }
     index.shrink_trailing();
+    // Mark all trees dirty so they rebuild with new storage positions.
     for dirty in index.tree_dirty.iter_mut() {
         *dirty = true;
     }

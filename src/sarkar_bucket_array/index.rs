@@ -94,6 +94,7 @@ impl FlatBucket {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn lsb_contains(&self, target: u64, data: &[u64]) -> bool {
         self.leaf_entries_for(target)
             .is_some_and(|entries| {
@@ -104,6 +105,7 @@ impl FlatBucket {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn lsb_find(&self, target: u64, data: &[u64]) -> Option<usize> {
         let entries = self.leaf_entries_for(target)?;
         entries
@@ -123,6 +125,7 @@ impl FlatBucket {
 
     /// Remove one occurrence of `target` from the tree in-place.
     /// Returns the storage_id if found, `None` otherwise.
+    #[allow(dead_code)]
     pub(crate) fn surgical_remove(&mut self, target: u64, data: &[u64]) -> Option<usize> {
         if self.nodes.is_empty() {
             return None;
@@ -178,6 +181,7 @@ impl FlatBucket {
     /// Remove a *specific* storage_id from the tree (for `remove_at` with duplicates).
     /// Navigates to the leaf, then scans all entries with the same value
     /// to find the exact storage_id.
+    #[allow(dead_code)]
     pub(crate) fn surgical_remove_id(&mut self, target: u64, storage_id: usize, data: &[u64]) -> bool {
         if self.nodes.is_empty() {
             return false;
@@ -242,12 +246,47 @@ impl FlatBucket {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn lsb_find_all(&self, target: u64, data: &[u64]) -> Vec<usize> {
         self.leaf_entries_for(target)
             .map(|entries| {
                 let start = entries.partition_point(|&id| data[id] < target);
                 let end = entries[start..].partition_point(|&id| data[id] == target) + start;
                 entries[start..end].to_vec()
+            })
+            .unwrap_or_default()
+    }
+
+    // ── Tombstone-aware lookups ────────────────────────────────
+    //
+    // These skip entries where `positions[id] == REMOVED_POSITION`,
+    // allowing the tree to contain dead entries (tombstones) that
+    // are filtered at lookup time.
+
+    /// Find the first LIVE entry matching `target`, skipping tombstones.
+    pub(crate) fn lsb_find_live(&self, target: u64, data: &[u64], positions: &[usize]) -> Option<usize> {
+        let entries = self.leaf_entries_for(target)?;
+        let start = entries.partition_point(|&id| data[id] < target);
+        for &id in &entries[start..] {
+            if data[id] != target { break; }
+            if positions[id] != REMOVED_POSITION {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// Find ALL live entries matching `target`, skipping tombstones.
+    pub(crate) fn lsb_find_all_live(&self, target: u64, data: &[u64], positions: &[usize]) -> Vec<usize> {
+        self.leaf_entries_for(target)
+            .map(|entries| {
+                let start = entries.partition_point(|&id| data[id] < target);
+                entries[start..]
+                    .iter()
+                    .take_while(|&&id| data[id] == target)
+                    .copied()
+                    .filter(|&id| positions[id] != REMOVED_POSITION)
+                    .collect()
             })
             .unwrap_or_default()
     }
@@ -277,6 +316,12 @@ impl FlatBucket {
                 let entries = &mut self.nodes[node_idx].entries;
                 let pos = entries.partition_point(|&id| data[id] < value);
                 entries.insert(pos, storage_id);
+
+                // Leaf splitting: if leaf exceeds LEAF_CAP, split it.
+                if entries.len() > LEAF_CAP && self.nodes[node_idx].bit_offset < 64 {
+                    self.split_leaf(node_idx, data);
+                }
+
                 return true;
             }
 
@@ -315,6 +360,52 @@ impl FlatBucket {
 
             node_idx = child_idx;
         }
+    }
+
+    /// Split a leaf node into an internal node with child leaves.
+    /// Called when a leaf exceeds LEAF_CAP after surgical insertion.
+    fn split_leaf(&mut self, node_idx: usize, data: &[u64]) {
+        let bit_offset = self.nodes[node_idx].bit_offset;
+        let entries = std::mem::take(&mut self.nodes[node_idx].entries);
+        let mask = SPLIT_FANOUT - 1;
+
+        // Distribute entries into buckets by bit pattern.
+        let mut buckets: [Vec<usize>; SPLIT_FANOUT] = std::array::from_fn(|_| Vec::new());
+        let mut child_bitmap: u64 = 0;
+        for &id in &entries {
+            let slot = ((data[id] >> bit_offset) as usize) & mask;
+            buckets[slot].push(id);
+            child_bitmap |= 1u64 << slot;
+        }
+
+        if child_bitmap.count_ones() <= 1 {
+            self.nodes[node_idx].entries = entries;
+            return;
+        }
+
+        // Allocate child slots.
+        let children_start = self.child_slots.len();
+        self.child_slots.resize(children_start + SPLIT_FANOUT, u32::MAX);
+
+        // Create child leaf nodes.
+        let next_offset = bit_offset + SPLIT_BITS;
+        for (slot, bucket) in buckets.into_iter().enumerate() {
+            if !bucket.is_empty() {
+                let child_idx = self.nodes.len() as u32;
+                self.child_slots[children_start + slot] = child_idx;
+                // Entries are already sorted (inherited from parent leaf).
+                self.nodes.push(FlatNode {
+                    entries: bucket,
+                    bit_offset: next_offset,
+                    child_bitmap: 0,
+                    children_start: 0,
+                });
+            }
+        }
+
+        // Transform current node from leaf to internal.
+        self.nodes[node_idx].child_bitmap = child_bitmap;
+        self.nodes[node_idx].children_start = children_start;
     }
 
     /// Build a dense LSB radix tree from a flat list of storage IDs.
@@ -373,11 +464,23 @@ impl FlatBucket {
             child_bitmap |= 1_u64 << child_idx;
         }
 
+        let child_count = child_bitmap.count_ones() as usize;
+        if child_count <= 1 {
+            let mut entries = ids.to_vec();
+            entries.sort_unstable_by_key(|&id| data[id]);
+            nodes[node_idx] = FlatNode {
+                entries,
+                bit_offset,
+                child_bitmap: 0,
+                children_start: 0,
+            };
+            return;
+        }
+
         let children_start = child_slots.len();
         child_slots.resize(children_start + SPLIT_FANOUT, u32::MAX);
 
         let child_nodes_start = nodes.len();
-        let child_count = child_bitmap.count_ones() as usize;
         nodes.resize_with(child_nodes_start + child_count, FlatNode::default);
 
         let next_bit_offset = bit_offset + SPLIT_BITS;
@@ -501,13 +604,17 @@ pub struct BucketStats {
 pub struct Bwspi {
     pub(crate) data: Vec<u64>,
 
-    // ── CRUD index (flat, O(1) operations) ───────────────────────
+    // ── CRUD index (flat, O(1) operations) ─────────────────────
     pub(crate) crud_buckets: Vec<Vec<usize>>,
     pub(crate) bucket_positions: Vec<usize>,
 
     // ── Lookup index (LSB radix tree, ≤64 per leaf) ──────────────
     pub(crate) trees: Vec<FlatBucket>,
     pub(crate) tree_dirty: Vec<bool>,
+    /// Number of tombstoned (dead) entries in each tree.
+    /// When this exceeds 25% of the bucket, the tree is marked dirty
+    /// for compaction on next access.
+    tree_tombstones: Vec<usize>,
 
     pub(crate) live_len: usize,
 }
@@ -524,6 +631,7 @@ impl Bwspi {
             bucket_positions: Vec::with_capacity(capacity),
             trees: Vec::new(),
             tree_dirty: Vec::new(),
+            tree_tombstones: Vec::new(),
             live_len: 0,
         }
     }
@@ -534,6 +642,7 @@ impl Bwspi {
             self.crud_buckets.resize_with(width + 1, Vec::new);
             self.trees.resize_with(width + 1, FlatBucket::new);
             self.tree_dirty.resize(width + 1, true);
+            self.tree_tombstones.resize(width + 1, 0);
         }
     }
 
@@ -550,6 +659,19 @@ impl Bwspi {
                 &self.crud_buckets[width], width, &self.data, 0
             );
             self.tree_dirty[width] = false;
+            self.tree_tombstones[width] = 0; // compaction: tombstones gone
+        } else if width < self.tree_tombstones.len() {
+            // Lazy compaction: if tombstones exceed 25% of original tree size,
+            // rebuild from clean crud_buckets.
+            let live = self.crud_buckets.get(width).map_or(0, |b| b.len());
+            let tombstones = self.tree_tombstones[width];
+            let total = live + tombstones;
+            if total > 0 && tombstones * 4 > total {
+                self.trees[width] = FlatBucket::build_from(
+                    &self.crud_buckets[width], width, &self.data, 0
+                );
+                self.tree_tombstones[width] = 0;
+            }
         }
     }
 
@@ -561,6 +683,7 @@ impl Bwspi {
             self.crud_buckets.pop();
             self.trees.pop();
             self.tree_dirty.pop();
+            self.tree_tombstones.pop();
         }
     }
 
@@ -612,6 +735,7 @@ impl Bwspi {
             self.crud_buckets.resize_with(width + 1, Vec::new);
             self.trees.resize_with(width + 1, FlatBucket::new);
             self.tree_dirty.resize(width + 1, true);
+            self.tree_tombstones.resize(width + 1, 0);
         }
         let bucket = &mut self.crud_buckets[width];
         self.bucket_positions.push(bucket.len());
@@ -671,6 +795,14 @@ impl Bwspi {
             }
         }
         self.live_len += values.len();
+
+        // Eager tree build: build trees now so subsequent operations
+        // (contains, remove) don't pay the lazy rebuild cost.
+        for (w, &count) in counts.iter().enumerate().take(max_width + 1) {
+            if count > 0 {
+                self.ensure_tree_clean(w);
+            }
+        }
     }
 
     #[inline]
@@ -678,7 +810,9 @@ impl Bwspi {
         let w = bit_width(target);
         self.ensure_tree_clean(w);
         if w >= self.trees.len() { return false; }
-        self.trees[w].lsb_contains(target, &self.data)
+        // Tombstone-aware: find a live entry matching target.
+        self.trees[w].lsb_find_live(target, &self.data, &self.bucket_positions)
+            .is_some()
     }
 
     #[inline]
@@ -686,7 +820,8 @@ impl Bwspi {
         let w = bit_width(target);
         self.ensure_tree_clean(w);
         if w >= self.trees.len() { return None; }
-        self.trees[w].lsb_find(target, &self.data)
+        // Tombstone-aware: skip dead entries.
+        self.trees[w].lsb_find_live(target, &self.data, &self.bucket_positions)
     }
 
     #[must_use]
@@ -694,7 +829,8 @@ impl Bwspi {
         let w = bit_width(target);
         self.ensure_tree_clean(w);
         if w >= self.trees.len() { return Vec::new(); }
-        self.trees[w].lsb_find_all(target, &self.data)
+        // Tombstone-aware: filter dead entries.
+        self.trees[w].lsb_find_all_live(target, &self.data, &self.bucket_positions)
     }
 
     #[inline]
@@ -706,18 +842,19 @@ impl Bwspi {
         let w = bit_width(target);
         if w >= self.crud_buckets.len() { return false; }
 
-        // Ensure tree is built (only rebuilds if dirty, e.g. from prior inserts).
+        // Ensure tree is built (compacts tombstones if needed).
         self.ensure_tree_clean(w);
         if w >= self.trees.len() { return false; }
 
-        // Surgical removal: remove from tree in-place, no rebuild.
-        let index = self.trees[w].surgical_remove(target, &self.data);
+        // Find a LIVE entry via tombstone-aware lookup.
+        let index = self.trees[w].lsb_find_live(target, &self.data, &self.bucket_positions);
 
         if let Some(i) = index {
-            // Unlink from CRUD bucket, but DON'T mark tree dirty —
-            // the tree is still valid after surgical removal.
+            // Tombstone: just unlink from CRUD bucket.
+            // The dead entry stays in the tree — lookups skip it.
             self.crud_unlink_inner(i, w, true);
             self.live_len -= 1;
+            self.tree_tombstones[w] += 1;
             self.shrink_trailing();
             true
         } else {
@@ -732,15 +869,16 @@ impl Bwspi {
         let value = self.data[index];
         let width = bit_width(value);
 
-        // Ensure tree is built, then surgically remove this exact entry.
-        self.ensure_tree_clean(width);
-        if width < self.trees.len() {
-            self.trees[width].surgical_remove_id(value, index, &self.data);
-        }
-
-        // Unlink from CRUD bucket without marking tree dirty.
+        // Tombstone: just unlink from CRUD bucket.
+        // Don't touch the tree — the dead entry is skipped by lookups.
         self.crud_unlink_inner(index, width, true);
         self.live_len -= 1;
+
+        // Track tombstone count (only if tree is clean/exists).
+        if width < self.tree_tombstones.len() && !self.tree_dirty.get(width).copied().unwrap_or(true) {
+            self.tree_tombstones[width] += 1;
+        }
+
         self.shrink_trailing();
         true
     }
@@ -751,7 +889,7 @@ impl Bwspi {
         let index = if w >= self.trees.len() {
             None
         } else {
-            self.trees[w].lsb_find(old, &self.data)
+            self.trees[w].lsb_find_live(old, &self.data, &self.bucket_positions)
         };
         index.is_some_and(|i| self.update_at(i, new))
     }

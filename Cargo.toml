@@ -28,6 +28,10 @@ harness = false
 name = "simd_bench"
 harness = false
 
+[[bench]]
+name = "hashset_vs_bwspi"
+harness = false
+
 [[bin]]
 name = "hardware_bench"
 path = "hardware_bench.rs"

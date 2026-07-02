@@ -1,11 +1,13 @@
 use super::{sarkar_sort, snapshot_sort};
 
-const REMOVED_POSITION: usize = usize::MAX;
-
 // ── LSB Radix Tree constants ─────────────────────────────────────────
 
 const LEAF_CAP: usize = 64;
 const DUPLICATE_GROUP_THRESHOLD: usize = 128;
+const PENDING_RECENT_SCAN: usize = 64;
+const PENDING_MERGE_THRESHOLD: usize = 1024;
+const REMOVED_POSITION: usize = usize::MAX;
+const NO_DUPLICATE_HINT: usize = usize::MAX;
 
 /// Computes the binary bit-width of a `u64` value.
 #[inline(always)]
@@ -38,7 +40,6 @@ pub fn bit_width(value: u64) -> usize {
 const SPLIT_BITS: u8 = 6;
 const SPLIT_FANOUT: usize = 1 << SPLIT_BITS; // 64
 
-#[derive(Default)]
 pub(crate) struct FlatNode {
     /// Storage IDs at leaf level. Empty for internal nodes.
     pub(crate) entries: Vec<usize>,
@@ -53,10 +54,21 @@ pub(crate) struct FlatNode {
     /// Start index of this node's 64 child slots inside FlatBucket.child_slots.
     pub(crate) children_start: usize,
 
-    /// Exact duplicate value stored by this leaf, when the leaf is a large
-    /// duplicate group. This keeps repeated remove/find from rescanning from 0.
-    duplicate_value: Option<u64>,
-    live_hint: usize,
+    /// Cursor for large exact-duplicate leaves. `NO_DUPLICATE_HINT` means this
+    /// is a normal leaf.
+    duplicate_hint: usize,
+}
+
+impl Default for FlatNode {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            bit_offset: 0,
+            child_bitmap: 0,
+            children_start: 0,
+            duplicate_hint: NO_DUPLICATE_HINT,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -290,16 +302,17 @@ impl FlatBucket {
     ) -> Option<usize> {
         let node_idx = self.leaf_node_index_for(target)?;
         let node = &mut self.nodes[node_idx];
-        if let Some(duplicate_value) = node.duplicate_value {
+        if node.duplicate_hint != NO_DUPLICATE_HINT {
+            let duplicate_value = data[*node.entries.first()?];
             if duplicate_value != target {
                 return None;
             }
-            while node.live_hint < node.entries.len() {
-                let id = node.entries[node.live_hint];
+            while node.duplicate_hint < node.entries.len() {
+                let id = node.entries[node.duplicate_hint];
                 if positions[id] != REMOVED_POSITION {
                     return Some(id);
                 }
-                node.live_hint += 1;
+                node.duplicate_hint += 1;
             }
             return None;
         }
@@ -328,8 +341,11 @@ impl FlatBucket {
             return Vec::new();
         };
         let node = &self.nodes[node_idx];
-        if let Some(duplicate_value) = node.duplicate_value {
-            if duplicate_value != target {
+        if node.duplicate_hint != NO_DUPLICATE_HINT {
+            let Some(&first_id) = node.entries.first() else {
+                return Vec::new();
+            };
+            if data[first_id] != target {
                 return Vec::new();
             }
             return node
@@ -348,145 +364,6 @@ impl FlatBucket {
             .copied()
             .filter(|&id| positions[id] != REMOVED_POSITION)
             .collect()
-    }
-
-    // ── Surgical Insert (no tree rebuild) ────────────────────────
-    //
-    // Traverses the tree to find the correct leaf for `value`,
-    // inserts the storage_id in sorted order.
-    // If a child slot doesn't exist, creates a new leaf node.
-    // Returns false if tree was never built (nodes empty).
-
-    /// Insert `storage_id` into the tree in-place without rebuilding.
-    /// Returns `true` if the insertion succeeded, `false` if the tree
-    /// has never been built (caller should mark dirty for lazy rebuild).
-    pub(crate) fn surgical_insert(&mut self, value: u64, storage_id: usize, data: &[u64]) -> bool {
-        if self.nodes.is_empty() {
-            return false; // tree never built — can't insert surgically
-        }
-
-        let mut node_idx = 0;
-
-        loop {
-            let bitmap = self.nodes[node_idx].child_bitmap;
-
-            if bitmap == 0 {
-                // Leaf node — insert in sorted order.
-                if self.nodes[node_idx].duplicate_value == Some(value) {
-                    self.nodes[node_idx].entries.push(storage_id);
-                    return true;
-                }
-                if self.nodes[node_idx].duplicate_value.is_some() {
-                    self.nodes[node_idx].duplicate_value = None;
-                    self.nodes[node_idx].live_hint = 0;
-                }
-
-                let entries = &mut self.nodes[node_idx].entries;
-                let pos = entries.partition_point(|&id| data[id] < value);
-                entries.insert(pos, storage_id);
-
-                // Leaf splitting: if leaf exceeds LEAF_CAP, split it.
-                if entries.len() > LEAF_CAP && self.nodes[node_idx].bit_offset < 64 {
-                    self.split_leaf(node_idx, data);
-                }
-
-                return true;
-            }
-
-            // Internal node — route to child.
-            let bit_offset = self.nodes[node_idx].bit_offset;
-            let children_start = self.nodes[node_idx].children_start;
-            let child_pos = ((value >> bit_offset) as usize) & (SPLIT_FANOUT - 1);
-            let bit = 1_u64 << child_pos;
-
-            if bitmap & bit == 0 {
-                // No child exists for this slot — create a new leaf.
-                let new_node_idx = self.nodes.len() as u32;
-                self.nodes.push(FlatNode {
-                    entries: vec![storage_id],
-                    bit_offset: bit_offset + SPLIT_BITS,
-                    child_bitmap: 0,
-                    children_start: 0,
-                    duplicate_value: None,
-                    live_hint: 0,
-                });
-
-                // Set the child slot to point to the new node.
-                let child_slot = children_start + child_pos;
-                if child_slot < self.child_slots.len() {
-                    self.child_slots[child_slot] = new_node_idx;
-                }
-
-                // Set the parent's bitmap bit.
-                self.nodes[node_idx].child_bitmap |= bit;
-                return true;
-            }
-
-            let child_slot = children_start + child_pos;
-            let child_idx = match self.child_slots.get(child_slot) {
-                Some(&idx) if idx != u32::MAX => idx as usize,
-                _ => return false,
-            };
-
-            node_idx = child_idx;
-        }
-    }
-
-    /// Split a leaf node into an internal node with child leaves.
-    /// Called when a leaf exceeds LEAF_CAP after surgical insertion.
-    fn split_leaf(&mut self, node_idx: usize, data: &[u64]) {
-        let bit_offset = self.nodes[node_idx].bit_offset;
-        let entries = std::mem::take(&mut self.nodes[node_idx].entries);
-        let mask = SPLIT_FANOUT - 1;
-
-        // Distribute entries into buckets by bit pattern.
-        let mut buckets: [Vec<usize>; SPLIT_FANOUT] = std::array::from_fn(|_| Vec::new());
-        let mut child_bitmap: u64 = 0;
-        let mut duplicate_value = entries.first().map(|&id| data[id]);
-        for &id in &entries {
-            if duplicate_value.is_some_and(|value| data[id] != value) {
-                duplicate_value = None;
-            }
-            let slot = ((data[id] >> bit_offset) as usize) & mask;
-            buckets[slot].push(id);
-            child_bitmap |= 1u64 << slot;
-        }
-
-        if child_bitmap.count_ones() <= 1 {
-            let duplicate_value =
-                duplicate_value.filter(|_| entries.len() >= DUPLICATE_GROUP_THRESHOLD);
-            self.nodes[node_idx].entries = entries;
-            self.nodes[node_idx].duplicate_value = duplicate_value;
-            self.nodes[node_idx].live_hint = 0;
-            return;
-        }
-
-        // Allocate child slots.
-        let children_start = self.child_slots.len();
-        self.child_slots
-            .resize(children_start + SPLIT_FANOUT, u32::MAX);
-
-        // Create child leaf nodes.
-        let next_offset = bit_offset + SPLIT_BITS;
-        for (slot, bucket) in buckets.into_iter().enumerate() {
-            if !bucket.is_empty() {
-                let child_idx = self.nodes.len() as u32;
-                self.child_slots[children_start + slot] = child_idx;
-                // Entries are already sorted (inherited from parent leaf).
-                self.nodes.push(FlatNode {
-                    entries: bucket,
-                    bit_offset: next_offset,
-                    child_bitmap: 0,
-                    children_start: 0,
-                    duplicate_value: None,
-                    live_hint: 0,
-                });
-            }
-        }
-
-        // Transform current node from leaf to internal.
-        self.nodes[node_idx].child_bitmap = child_bitmap;
-        self.nodes[node_idx].children_start = children_start;
     }
 
     /// Build a dense LSB radix tree from a flat list of storage IDs.
@@ -532,8 +409,7 @@ impl FlatBucket {
                 bit_offset,
                 child_bitmap: 0,
                 children_start: 0,
-                duplicate_value: None,
-                live_hint: 0,
+                duplicate_hint: NO_DUPLICATE_HINT,
             };
             return;
         }
@@ -560,8 +436,13 @@ impl FlatBucket {
                 bit_offset,
                 child_bitmap: 0,
                 children_start: 0,
-                duplicate_value: duplicate_value.filter(|_| ids.len() >= DUPLICATE_GROUP_THRESHOLD),
-                live_hint: 0,
+                duplicate_hint: if duplicate_value.is_some()
+                    && ids.len() >= DUPLICATE_GROUP_THRESHOLD
+                {
+                    0
+                } else {
+                    NO_DUPLICATE_HINT
+                },
             };
             return;
         }
@@ -595,8 +476,7 @@ impl FlatBucket {
             bit_offset,
             child_bitmap,
             children_start,
-            duplicate_value: None,
-            live_hint: 0,
+            duplicate_hint: NO_DUPLICATE_HINT,
         };
     }
 
@@ -681,6 +561,17 @@ pub struct BucketStats {
     pub percentage: f64,
 }
 
+#[derive(Clone, Copy)]
+struct LookupCacheEntry {
+    value: u64,
+    storage_id: usize,
+}
+
+enum LiveLookup {
+    Pending(usize),
+    Tree(usize),
+}
+
 // ── Bwspi (Dual-Index with Lazy Tree) ────────────────────────────────
 //
 //   crud_buckets — flat Vec<usize> per bit-width.
@@ -705,6 +596,9 @@ pub struct Bwspi {
     // ── Lookup index (LSB radix tree, ≤64 per leaf) ──────────────
     pub(crate) trees: Vec<FlatBucket>,
     pub(crate) tree_dirty: Vec<bool>,
+    pending_inserts: Vec<Vec<usize>>,
+    pending_membership: Vec<bool>,
+    lookup_cache: Vec<Option<LookupCacheEntry>>,
     /// Number of tombstoned (dead) entries in each tree.
     /// When this exceeds 25% of the bucket, the tree is marked dirty
     /// for compaction on next access.
@@ -727,6 +621,9 @@ impl Bwspi {
             bucket_positions: Vec::with_capacity(capacity),
             trees: Vec::new(),
             tree_dirty: Vec::new(),
+            pending_inserts: Vec::new(),
+            pending_membership: Vec::with_capacity(capacity),
+            lookup_cache: Vec::new(),
             tree_tombstones: Vec::new(),
             live_len: 0,
         }
@@ -738,10 +635,131 @@ impl Bwspi {
             self.crud_buckets.resize_with(width + 1, Vec::new);
             self.trees.resize_with(width + 1, FlatBucket::new);
             self.tree_dirty.resize(width + 1, true);
+            self.pending_inserts.resize_with(width + 1, Vec::new);
+            self.lookup_cache.resize(width + 1, None);
             self.tree_tombstones.resize(width + 1, 0);
         }
     }
 
+    #[inline]
+    fn clear_lookup_cache_width(&mut self, width: usize) {
+        if let Some(slot) = self.lookup_cache.get_mut(width) {
+            *slot = None;
+        }
+    }
+
+    #[inline]
+    fn lookup_cache_get(&mut self, width: usize, target: u64) -> Option<usize> {
+        let slot = self.lookup_cache.get_mut(width)?;
+        let entry = (*slot)?;
+        if entry.value == target
+            && self.bucket_positions.get(entry.storage_id) != Some(&REMOVED_POSITION)
+            && self.data.get(entry.storage_id) == Some(&target)
+        {
+            return Some(entry.storage_id);
+        }
+        *slot = None;
+        None
+    }
+
+    #[inline]
+    fn lookup_cache_put(&mut self, width: usize, target: u64, storage_id: usize) {
+        if let Some(slot) = self.lookup_cache.get_mut(width) {
+            *slot = Some(LookupCacheEntry {
+                value: target,
+                storage_id,
+            });
+        }
+    }
+
+    #[inline]
+    fn add_pending_insert(&mut self, width: usize, storage_id: usize) {
+        self.pending_inserts[width].push(storage_id);
+        self.pending_membership[storage_id] = true;
+    }
+
+    fn clear_pending_width(&mut self, width: usize) {
+        if width >= self.pending_inserts.len() {
+            return;
+        }
+        for id in self.pending_inserts[width].drain(..) {
+            if let Some(is_pending) = self.pending_membership.get_mut(id) {
+                *is_pending = false;
+            }
+        }
+    }
+
+    #[inline]
+    fn pending_len(&self, width: usize) -> usize {
+        self.pending_inserts.get(width).map_or(0, Vec::len)
+    }
+
+    #[inline]
+    fn pending_find_live_limited(&self, width: usize, target: u64, limit: usize) -> Option<usize> {
+        let pending = self.pending_inserts.get(width)?;
+        for &id in pending.iter().rev().take(limit) {
+            if self.pending_membership.get(id) == Some(&true)
+                && self.bucket_positions.get(id) != Some(&REMOVED_POSITION)
+                && self.data.get(id) == Some(&target)
+            {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    fn pending_find_live(&self, width: usize, target: u64) -> Option<usize> {
+        let pending = self.pending_inserts.get(width)?;
+        self.pending_find_live_limited(width, target, pending.len())
+    }
+
+    fn lookup_live(&mut self, width: usize, target: u64) -> Option<LiveLookup> {
+        if let Some(id) = self.lookup_cache_get(width, target) {
+            return if self.pending_membership.get(id) == Some(&true) {
+                Some(LiveLookup::Pending(id))
+            } else {
+                Some(LiveLookup::Tree(id))
+            };
+        }
+
+        let pending_len = self.pending_len(width);
+        if pending_len > PENDING_MERGE_THRESHOLD {
+            if let Some(id) = self.pending_find_live_limited(width, target, PENDING_RECENT_SCAN) {
+                self.lookup_cache_put(width, target, id);
+                return Some(LiveLookup::Pending(id));
+            }
+            self.rebuild_tree_width(width);
+        } else if let Some(id) = self.pending_find_live(width, target) {
+            self.lookup_cache_put(width, target, id);
+            return Some(LiveLookup::Pending(id));
+        }
+
+        let id = self.trees[width].lsb_find_live(target, &self.data, &self.bucket_positions)?;
+        self.lookup_cache_put(width, target, id);
+        Some(LiveLookup::Tree(id))
+    }
+    fn pending_find_all_live(&self, width: usize, target: u64) -> Vec<usize> {
+        let Some(pending) = self.pending_inserts.get(width) else {
+            return Vec::new();
+        };
+        pending
+            .iter()
+            .copied()
+            .filter(|&id| {
+                self.pending_membership.get(id) == Some(&true)
+                    && self.bucket_positions.get(id) != Some(&REMOVED_POSITION)
+                    && self.data.get(id) == Some(&target)
+            })
+            .collect()
+    }
+
+    fn rebuild_tree_width(&mut self, width: usize) {
+        self.trees[width] = FlatBucket::build_from(&self.crud_buckets[width], width, &self.data, 0);
+        self.tree_dirty[width] = false;
+        self.tree_tombstones[width] = 0;
+        self.clear_pending_width(width);
+        self.clear_lookup_cache_width(width);
+    }
     // ── Lazy tree rebuild ────────────────────────────────────────
     //
     // Only rebuilds tree[w] when a lookup needs it and it's dirty.
@@ -751,10 +769,7 @@ impl Bwspi {
     #[inline]
     fn ensure_tree_clean(&mut self, width: usize) {
         if width < self.tree_dirty.len() && self.tree_dirty[width] {
-            self.trees[width] =
-                FlatBucket::build_from(&self.crud_buckets[width], width, &self.data, 0);
-            self.tree_dirty[width] = false;
-            self.tree_tombstones[width] = 0; // compaction: tombstones gone
+            self.rebuild_tree_width(width);
         } else if width < self.tree_tombstones.len() {
             // Lazy compaction: if tombstones exceed 25% of original tree size,
             // rebuild from clean crud_buckets.
@@ -762,9 +777,7 @@ impl Bwspi {
             let tombstones = self.tree_tombstones[width];
             let total = live + tombstones;
             if total > 0 && tombstones * 4 > total {
-                self.trees[width] =
-                    FlatBucket::build_from(&self.crud_buckets[width], width, &self.data, 0);
-                self.tree_tombstones[width] = 0;
+                self.rebuild_tree_width(width);
             }
         }
     }
@@ -777,6 +790,8 @@ impl Bwspi {
             self.crud_buckets.pop();
             self.trees.pop();
             self.tree_dirty.pop();
+            self.pending_inserts.pop();
+            self.lookup_cache.pop();
             self.tree_tombstones.pop();
         }
     }
@@ -825,21 +840,16 @@ impl Bwspi {
         let index = self.data.len();
         self.data.push(value);
         let width = bit_width(value);
-        if width >= self.crud_buckets.len() {
-            self.crud_buckets.resize_with(width + 1, Vec::new);
-            self.trees.resize_with(width + 1, FlatBucket::new);
-            self.tree_dirty.resize(width + 1, true);
-            self.tree_tombstones.resize(width + 1, 0);
-        }
+        self.ensure_width(width);
         let bucket = &mut self.crud_buckets[width];
         self.bucket_positions.push(bucket.len());
+        self.pending_membership.push(false);
         bucket.push(index);
 
-        // If the tree for this width is already clean, surgically insert
-        // to keep it valid (avoids O(N) rebuild on next contains).
-        // If tree is dirty or never built, just mark dirty — O(1) path.
-        if !self.tree_dirty[width] && !self.trees[width].surgical_insert(value, index, &self.data) {
-            self.tree_dirty[width] = true; // fallback: tree empty/broken
+        // Clean trees stay stable. New IDs live in a small per-width delta
+        // overlay so mixed insert+contains does not pay tree mutation cost.
+        if !self.tree_dirty[width] {
+            self.add_pending_insert(width, index);
         }
 
         self.live_len += 1;
@@ -878,6 +888,8 @@ impl Bwspi {
             }
         }
         self.bucket_positions.resize(start_idx + values.len(), 0);
+        self.pending_membership
+            .resize(start_idx + values.len(), false);
         let pos_slice = &mut self.bucket_positions[start_idx..];
         for (i, &value) in values.iter().enumerate() {
             let w = bit_width(value);
@@ -908,10 +920,7 @@ impl Bwspi {
         if w >= self.trees.len() {
             return false;
         }
-        // Tombstone-aware: find a live entry matching target.
-        self.trees[w]
-            .lsb_find_live(target, &self.data, &self.bucket_positions)
-            .is_some()
+        self.lookup_live(w, target).is_some()
     }
 
     #[inline]
@@ -921,8 +930,9 @@ impl Bwspi {
         if w >= self.trees.len() {
             return None;
         }
-        // Tombstone-aware: skip dead entries.
-        self.trees[w].lsb_find_live(target, &self.data, &self.bucket_positions)
+        match self.lookup_live(w, target)? {
+            LiveLookup::Pending(id) | LiveLookup::Tree(id) => Some(id),
+        }
     }
 
     #[must_use]
@@ -932,8 +942,9 @@ impl Bwspi {
         if w >= self.trees.len() {
             return Vec::new();
         }
-        // Tombstone-aware: filter dead entries.
-        self.trees[w].lsb_find_all_live(target, &self.data, &self.bucket_positions)
+        let mut found = self.trees[w].lsb_find_all_live(target, &self.data, &self.bucket_positions);
+        found.extend(self.pending_find_all_live(w, target));
+        found
     }
 
     #[inline]
@@ -947,25 +958,31 @@ impl Bwspi {
             return false;
         }
 
-        // Ensure tree is built (compacts tombstones if needed).
         self.ensure_tree_clean(w);
         if w >= self.trees.len() {
             return false;
         }
 
-        // Find a LIVE entry via tombstone-aware lookup.
-        let index = self.trees[w].lsb_find_live(target, &self.data, &self.bucket_positions);
-
-        if let Some(i) = index {
-            // Tombstone: just unlink from CRUD bucket.
-            // The dead entry stays in the tree — lookups skip it.
-            self.crud_unlink_inner(i, w, true);
-            self.live_len -= 1;
-            self.tree_tombstones[w] += 1;
-            self.shrink_trailing();
-            true
-        } else {
-            false
+        match self.lookup_live(w, target) {
+            Some(LiveLookup::Pending(i)) => {
+                self.pending_membership[i] = false;
+                self.crud_unlink_inner(i, w, true);
+                self.live_len -= 1;
+                self.clear_lookup_cache_width(w);
+                self.shrink_trailing();
+                true
+            }
+            Some(LiveLookup::Tree(i)) => {
+                // Tombstone: just unlink from CRUD bucket.
+                // The dead entry stays in the tree — lookups skip it.
+                self.crud_unlink_inner(i, w, true);
+                self.live_len -= 1;
+                self.tree_tombstones[w] += 1;
+                self.clear_lookup_cache_width(w);
+                self.shrink_trailing();
+                true
+            }
+            None => false,
         }
     }
 
@@ -980,31 +997,31 @@ impl Bwspi {
         let value = self.data[index];
         let width = bit_width(value);
 
+        let was_pending = self.pending_membership.get(index).copied().unwrap_or(false);
+        if was_pending {
+            self.pending_membership[index] = false;
+        }
+
         // Tombstone: just unlink from CRUD bucket.
         // Don't touch the tree — the dead entry is skipped by lookups.
         self.crud_unlink_inner(index, width, true);
         self.live_len -= 1;
 
-        // Track tombstone count (only if tree is clean/exists).
-        if width < self.tree_tombstones.len()
+        // Track tombstone count only for entries that are actually in the tree.
+        if !was_pending
+            && width < self.tree_tombstones.len()
             && !self.tree_dirty.get(width).copied().unwrap_or(true)
         {
             self.tree_tombstones[width] += 1;
         }
 
+        self.clear_lookup_cache_width(width);
         self.shrink_trailing();
         true
     }
 
     pub fn update(&mut self, old: u64, new: u64) -> bool {
-        let w = bit_width(old);
-        self.ensure_tree_clean(w);
-        let index = if w >= self.trees.len() {
-            None
-        } else {
-            self.trees[w].lsb_find_live(old, &self.data, &self.bucket_positions)
-        };
-        index.is_some_and(|i| self.update_at(i, new))
+        self.find(old).is_some_and(|i| self.update_at(i, new))
     }
 
     pub fn update_at(&mut self, index: usize, new: u64) -> bool {
@@ -1018,14 +1035,24 @@ impl Bwspi {
         let old = self.data[index];
         let old_width = bit_width(old);
         let new_width = bit_width(new);
+        let was_pending = self.pending_membership.get(index).copied().unwrap_or(false);
+        self.clear_lookup_cache_width(old_width);
+        if new_width != old_width {
+            self.clear_lookup_cache_width(new_width);
+        }
 
         if old_width == new_width {
-            // Same width — just update the data.
-            // Flat index: same bucket, same position — nothing to do.
-            // Tree: mark dirty (will rebuild on next lookup).
+            // Same width pending entries are not in the tree yet; base entries
+            // still need a rebuild because their sorted leaf position changed.
             self.data[index] = new;
-            self.tree_dirty[old_width] = true;
+            if !was_pending {
+                self.tree_dirty[old_width] = true;
+            }
             return true;
+        }
+
+        if was_pending {
+            self.pending_membership[index] = false;
         }
 
         // Different width — rebucket in flat index only.
@@ -1055,12 +1082,16 @@ impl Bwspi {
         self.sarkar_sort()
     }
 
-    /// Rebuild all dirty trees. Called before sort/snapshot.
+    /// Rebuild all dirty trees and merge any pending overlay IDs.
     fn rebuild_all_dirty(&mut self) {
         for w in 0..self.tree_dirty.len() {
-            if self.tree_dirty[w] {
-                self.trees[w] = FlatBucket::build_from(&self.crud_buckets[w], w, &self.data, 0);
-                self.tree_dirty[w] = false;
+            let has_pending = self
+                .pending_inserts
+                .get(w)
+                .is_some_and(|pending| !pending.is_empty());
+            let has_tombstones = self.tree_tombstones.get(w).copied().unwrap_or(0) > 0;
+            if self.tree_dirty[w] || has_pending || has_tombstones {
+                self.rebuild_tree_width(w);
             }
         }
     }
@@ -1142,8 +1173,23 @@ impl Bwspi {
         let crud_inner: usize = self.crud_buckets.iter().map(|b| b.capacity() * 8).sum();
         let tree_outer = self.trees.capacity() * std::mem::size_of::<FlatBucket>();
         let tree_inner: usize = self.trees.iter().map(|t| t.tree_overhead_bytes()).sum();
+        let pending_outer = self.pending_inserts.capacity() * std::mem::size_of::<Vec<usize>>();
+        let pending_inner: usize = self.pending_inserts.iter().map(|p| p.capacity() * 8).sum();
+        let pending_flags = self.pending_membership.capacity() * std::mem::size_of::<bool>();
+        let cache_bytes =
+            self.lookup_cache.capacity() * std::mem::size_of::<Option<LookupCacheEntry>>();
         let dirty_bytes = self.tree_dirty.capacity();
-        data_bytes + pos_bytes + crud_outer + crud_inner + tree_outer + tree_inner + dirty_bytes
+        data_bytes
+            + pos_bytes
+            + crud_outer
+            + crud_inner
+            + tree_outer
+            + tree_inner
+            + pending_outer
+            + pending_inner
+            + pending_flags
+            + cache_bytes
+            + dirty_bytes
     }
 }
 

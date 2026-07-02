@@ -210,6 +210,52 @@ fn recursive_splitting_for_uniform_distribution() {
 }
 
 #[test]
+fn pending_insert_overlay_keeps_clean_tree_valid() {
+    let mut index = Bwspi::new();
+    index.insert_bulk(&[10, 20, 30]);
+    assert!(index.contains(20));
+
+    let id = index.insert(40);
+    assert_eq!(index.get(id), Some(40));
+    assert!(index.contains(40));
+    assert_eq!(index.find(40), Some(id));
+    assert!(index.contains(20));
+
+    let mut expected: Vec<_> = index.iter().map(|(_, value)| value).collect();
+    expected.sort_unstable();
+    assert_eq!(index.sorted_snapshot(), expected);
+}
+
+#[test]
+fn pending_overlay_merges_for_non_recent_lookup() {
+    let mut index = Bwspi::new();
+    index.insert_bulk(&[1_000]);
+    assert!(index.contains(1_000));
+
+    let first_pending = index.insert(1_001);
+    for value in 1_002..2_200 {
+        index.insert(value);
+    }
+
+    assert_eq!(index.find(1_001), Some(first_pending));
+    assert!(index.remove(1_001));
+    assert!(!index.contains(1_001));
+}
+#[test]
+fn pending_insert_overlay_supports_update_and_remove() {
+    let mut index = Bwspi::new();
+    index.insert_bulk(&[10, 20, 30]);
+    assert!(index.contains(20));
+
+    let id = index.insert(40);
+    assert!(index.update_at(id, 41));
+    assert!(!index.contains(40));
+    assert!(index.contains(41));
+    assert!(index.remove(41));
+    assert!(!index.contains(41));
+    assert_eq!(index.len(), 3);
+}
+#[test]
 fn duplicate_heavy_bucket_removes_without_repeated_leaf_rescan() {
     let mut index = Bwspi::new();
     for _ in 0..10_000 {

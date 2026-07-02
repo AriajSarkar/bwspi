@@ -210,6 +210,29 @@ fn recursive_splitting_for_uniform_distribution() {
 }
 
 #[test]
+fn duplicate_heavy_bucket_removes_without_repeated_leaf_rescan() {
+    let mut index = Bwspi::new();
+    for _ in 0..10_000 {
+        index.insert(42);
+    }
+
+    assert_eq!(index.len(), 10_000);
+    assert_eq!(index.bucket_size(6), 10_000);
+    assert!(index.contains(42));
+
+    for _ in 0..5_000 {
+        assert!(index.remove(42));
+    }
+    assert_eq!(index.len(), 5_000);
+    assert!(index.contains(42));
+
+    for _ in 0..5_000 {
+        assert!(index.remove(42));
+    }
+    assert_eq!(index.len(), 0);
+    assert!(!index.contains(42));
+}
+#[test]
 fn deep_recursive_split_stress_test() {
     // Insert 10,000 elements in one bit-width bucket to trigger
     // multiple levels of recursive splitting.
@@ -226,9 +249,11 @@ fn deep_recursive_split_stress_test() {
     // The tree must have split recursively.
     assert!(index.trees[32].has_split());
     // Max depth should be > 1 (sub-of-sub splitting).
-    assert!(index.trees[32].max_depth() > 1,
+    assert!(
+        index.trees[32].max_depth() > 1,
         "expected recursive splits, got depth {}",
-        index.trees[32].max_depth());
+        index.trees[32].max_depth()
+    );
 
     // Every value must be findable.
     for i in 0..10_000_u64 {
